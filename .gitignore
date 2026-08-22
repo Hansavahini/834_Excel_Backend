@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+.venv/
+ENV/
+
+# Django
+*.log
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+
+# Environment variables
+.env
+.env.*
+
+# Django migrations (optional)
+# Keep migrations if this is a shared production project
+# Uncomment only if you don't want to push migrations
+# */migrations/*.py
+# !*/migrations/__init__.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build files
+dist/
+build/
+
+# Node (if frontend exists inside repo)
+node_modules/
+npm-debug.log*
+
+# Uploaded files
+uploads/
+*.xlsx
+*.csv
+
+# Secrets
+*.pem
+*.key
