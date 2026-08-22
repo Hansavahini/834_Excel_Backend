@@ -1,34 +1,161 @@
-def build_excel_rows(
-        loops,
-        mappings
-):
+"""
+Turn member loops into Excel rows using the mapping rules.
 
-    rows = []
+The previous builder matched on (segment, element) only, took the first hit and
+ignored the occurrence field even though both the parser and the mapping
+serializer carried one. In an 834 that is not close enough. NM1 appears for the
+insured, the sponsor, the payer and the custodial parent; DTP03 is a begin date
+when DTP01 is 348 and a termination date when it is 349; REF02 is an SSN under
+REF01=0F and a group number under 1L. Matching on the element alone means every
+one of those columns gets whichever instance came first in the file.
+
+Resolution order here is qualifier, then occurrence, then position.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Iterable, List, Optional
+
+from .transforms import apply_transform
+
+logger = logging.getLogger("edi.row_builder")
 
 
+def _normalise_rule(rule) -> dict:
+    """
+    Accept either a MappingDetail instance or the plain dict the API takes, so
+    the same builder serves a saved template and an ad-hoc request body.
+    """
+    if isinstance(rule, dict):
+        return {
+            "excel_column": rule.get("excel_column", ""),
+            "segment": (rule.get("segment") or "").upper(),
+            "element": (rule.get("element") or "").upper(),
+            "qualifier_element": (rule.get("qualifier_element") or "").upper(),
+            "qualifier_value": rule.get("qualifier_value") or "",
+            "component_index": rule.get("component_index"),
+            "occurrence": rule.get("occurrence") or 1,
+            "applies_to": rule.get("applies_to") or "BOTH",
+            "transform": rule.get("transform") or "NONE",
+            "default_value": rule.get("default_value") or "",
+            "is_required": bool(rule.get("is_required")),
+        }
+    return {
+        "excel_column": rule.excel_column,
+        "segment": rule.segment_element.segment_name.upper(),
+        "element": rule.segment_element.element_code.upper(),
+        "qualifier_element": (rule.qualifier_element or "").upper(),
+        "qualifier_value": rule.qualifier_value or "",
+        "component_index": rule.component_index,
+        "occurrence": rule.occurrence or 1,
+        "applies_to": rule.applies_to,
+        "transform": rule.transform,
+        "default_value": rule.default_value or "",
+        "is_required": rule.is_required,
+    }
+
+
+def _element_index(element_code: str, segment_name: str) -> Optional[int]:
+    """NM103 in segment NM1 is element index 3."""
+    if not element_code.startswith(segment_name):
+        return None
+    tail = element_code[len(segment_name):]
+    return int(tail) if tail.isdigit() else None
+
+
+def resolve(rule: dict, segments: List) -> str:
+    """Find the value for one mapping rule inside one member loop."""
+    index = _element_index(rule["element"], rule["segment"])
+    if index is None:
+        return ""
+
+    qualifier_element = rule["qualifier_element"]
+    qualifier_value = rule["qualifier_value"]
+    qualifier_index = (
+        _element_index(qualifier_element, rule["segment"]) if qualifier_element else None
+    )
+
+    matches = 0
+    for segment in segments:
+        if segment.name != rule["segment"]:
+            continue
+        if qualifier_index is not None:
+            if segment.get(qualifier_index).strip().upper() != qualifier_value.strip().upper():
+                continue
+        matches += 1
+        if matches < rule["occurrence"]:
+            continue
+        if rule["component_index"]:
+            return segment.component(index, rule["component_index"])
+        return segment.get(index)
+    return ""
+
+
+def build_row(loop, rules: List[dict], header_segments: Optional[List] = None) -> dict:
+    """Build one Excel row from one member loop."""
+    row: dict = {}
+    warnings: List[str] = []
+    applies = loop.applies_to  # SUB or DEP
+
+    for rule in rules:
+        if rule["applies_to"] not in ("BOTH", applies):
+            row[rule["excel_column"]] = ""
+            continue
+
+        value = resolve(rule, loop.segments)
+        if not value and header_segments:
+            # A few columns legitimately come from the file header, e.g. the
+            # sponsor name in loop 1000A. Fall back to it rather than blank.
+            value = resolve(rule, header_segments)
+        if not value:
+            value = rule["default_value"]
+            if rule["is_required"] and not value:
+                warnings.append(
+                    "Loop {loop}: required column '{col}' had no {element}.".format(
+                        loop=loop.loop_id, col=rule["excel_column"], element=rule["element"]
+                    )
+                )
+
+        row[rule["excel_column"]] = apply_transform(value, rule["transform"])
+
+    if warnings:
+        row.setdefault("__warnings__", []).extend(warnings)
+    return row
+
+
+def iter_excel_rows(loops: Iterable, mappings: List, header_segments: Optional[List] = None):
+    """Stream rows so a 27,000 member file never has 27,000 dicts alive at once."""
+    rules = [_normalise_rule(rule) for rule in mappings]
     for loop in loops:
-
-        row = {}
-
-
-        for mapping in mappings:
-
-            for item in loop["data"]:
-
-                if (
-                    item["segment"] == mapping["segment"]
-                    and
-                    item["element"] == mapping["element"]
-                ):
-
-                    row[
-                        mapping["excel_column"]
-                    ] = item["value"]
-
-                    break
+        yield build_row(loop, rules, header_segments=header_segments)
 
 
-        rows.append(row)
+def build_excel_rows(loops, mappings, header_segments: Optional[List] = None) -> List[dict]:
+    """
+    Materialised form, keeping the original public name and argument order.
+
+    Accepts a ParsedFile, a list of MemberLoop, or the legacy list of
+    {"loop_id", "data"} dicts. The last of these raises, because the flat dict
+    form cannot carry the qualifier information the rules now need.
+    """
+    if hasattr(loops, "loops"):
+        header_segments = header_segments or loops.header
+        loops = loops.loops
+
+    loops = list(loops)
+    if loops and isinstance(loops[0], dict):
+        raise TypeError(
+            "build_excel_rows() now takes MemberLoop objects from extract_loops(). "
+            "The old {'loop_id', 'data'} dicts cannot express qualifier matching."
+        )
+
+    return list(iter_excel_rows(loops, mappings, header_segments=header_segments))
 
 
-    return rows
+def collect_warnings(rows: List[dict]) -> List[str]:
+    """Pull the per-row warnings out so they can be stored on ConversionHistory."""
+    warnings: List[str] = []
+    for row in rows:
+        warnings.extend(row.pop("__warnings__", []))
+    return warnings
