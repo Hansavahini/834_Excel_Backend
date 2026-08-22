@@ -10,6 +10,9 @@ env/
 ENV/
 
 # Django
+db.sqlite3
+media/
+uploads/
 *.log
 db.sqlite3
 db.sqlite3-journal
