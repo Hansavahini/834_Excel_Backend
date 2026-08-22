@@ -1,0 +1,8 @@
+[console_scripts]
+x12html = pyx12.scripts.x12html:main
+x12info = pyx12.scripts.x12info:main
+x12norm = pyx12.scripts.x12norm:main
+x12valid = pyx12.scripts.x12valid:main
+x12xml = pyx12.scripts.x12xml:main
+xmlx12 = pyx12.scripts.xmlx12:main
+

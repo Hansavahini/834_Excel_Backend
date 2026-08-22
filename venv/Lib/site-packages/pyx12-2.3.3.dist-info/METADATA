@@ -1,0 +1,29 @@
+Metadata-Version: 2.0
+Name: pyx12
+Version: 2.3.3
+Summary: HIPAA X12 validator, parser and converter
+Home-page: http://github.com/azoner/pyx12
+Author: John Holland
+Author-email: john.holland@swmbh.org
+License: BSD
+Keywords: x12 hipaa healthcare edi
+Platform: All
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Healthcare Industry
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: BSD License
+Classifier: Programming Language :: Python
+Classifier: Programming Language :: Python :: 2
+Classifier: Programming Language :: Python :: 2.7
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.4
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Topic :: Office/Business
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+
+Pyx12 is a HIPAA X12 document validator and converter. It parses an ANSI X12N data file and
+validates it against a representation of the Implementation Guidelines for a HIPAA transaction. By default, it
+creates a 997 response for 4010 and a 999 response for 5010. It can create an html representation of the X12
+document or can translate to and from an XML representation of the data file.
+

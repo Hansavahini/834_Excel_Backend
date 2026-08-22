@@ -1,0 +1,92 @@
+# =========================
+# Python
+# =========================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+*.so
+.Python
+
+# =========================
+# Virtual Environment
+# =========================
+
+venv/
+env/
+ENV/
+.venv/
+
+# =========================
+# Django
+# =========================
+
+*.log
+
+db.sqlite3
+db.sqlite3-journal
+
+staticfiles/
+
+media/
+
+# =========================
+# Environment Variables
+# =========================
+
+.env
+.env.*
+
+# =========================
+# IDE / Editor
+# =========================
+
+.vscode/
+.idea/
+
+*.swp
+*.swo
+
+# =========================
+# OS Files
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+# Test / Coverage
+# =========================
+
+.coverage
+htmlcov/
+.pytest_cache/
+
+# =========================
+# Jupyter
+# =========================
+
+.ipynb_checkpoints/
+
+# =========================
+# Generated EDI Files
+# =========================
+
+uploads/
+outputs/
+
+*.x12
+*.edi
+*.834
+*.835
+
+# Generated Excel files
+*.xlsx
+*.xls
+
+# =========================
+# Django Migration Cache
+# =========================
+
+*/migrations/__pycache__/
