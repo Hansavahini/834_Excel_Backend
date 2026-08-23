@@ -74,18 +74,24 @@ class EDIUploadView(APIView):
 
     def post(self, request):
         serializer = EDIFileUploadSerializer(data=request.data)
+
         if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         upload = serializer.validated_data["file"]
         checksum = sha256_of(upload)
 
         existing = UploadedFile.objects.filter(
-            owner=request.user, content_sha256=checksum
+            owner=request.user,
+            content_sha256=checksum,
         ).first()
+
         if existing:
-            # The unique constraint would raise an IntegrityError here; a
-            # re-upload of an identical file is a normal event, not an error.
+            # The unique constraint would raise an IntegrityError here;
+            # a re-upload of an identical file is a normal event, not an error.
             return Response(
                 {
                     "message": "This file has already been uploaded.",
@@ -104,13 +110,23 @@ class EDIUploadView(APIView):
             content_sha256=checksum,
             processing_status=ProcessingStatus.PENDING,
         )
-        record.stored_file.save(upload.name, upload, save=False)
+
+        record.stored_file.save(
+            upload.name,
+            upload,
+            save=False,
+        )
         record.save()
 
         try:
             record.processing_status = ProcessingStatus.PARSING
             record.processing_started_at = timezone.now()
-            record.save(update_fields=["processing_status", "processing_started_at"])
+            record.save(
+                update_fields=[
+                    "processing_status",
+                    "processing_started_at",
+                ]
+            )
 
             parser = EDI834Parser(record.stored_file.path)
 
@@ -119,20 +135,23 @@ class EDIUploadView(APIView):
             # 6 MB file; the header is all envelope_facts needs, so capture it
             # on the way past and let the rest be garbage collected.
             header = []
-
             header_done = False
 
             def capture_header(stream):
                 nonlocal header_done
+
                 for segment in stream:
                     if not header_done:
                         if segment.name == "INS":
                             header_done = True
                         else:
                             header.append(segment)
+
                     yield segment
 
-            result = validate_834(capture_header(parser.iter_segments()))
+            result = validate_834(
+                capture_header(parser.iter_segments())
+            )
             facts = envelope_facts(header)
 
             for field_name in (
@@ -143,15 +162,29 @@ class EDIUploadView(APIView):
                 "receiver_id",
                 "sponsor_name",
             ):
-                setattr(record, field_name, facts[field_name][:60])
-            record.file_date = _parse_x12_date(facts["file_date"])
+                setattr(
+                    record,
+                    field_name,
+                    facts[field_name][:60],
+                )
+
+            record.file_date = _parse_x12_date(
+                facts["file_date"]
+            )
             record.segment_count = result.segment_count
             record.member_loop_count = result.member_loop_count
             record.is_full_file = result.is_full_file
+
             record.processing_status = (
-                ProcessingStatus.PARSED if result.is_valid else ProcessingStatus.QUARANTINED
+                ProcessingStatus.PARSED
+                if result.is_valid
+                else ProcessingStatus.QUARANTINED
             )
-            record.error_message = "\n".join(result.errors)[:4000]
+
+            record.error_message = "\n".join(
+                result.errors
+            )[:4000]
+
             record.processing_finished_at = timezone.now()
             record.save()
 
@@ -160,30 +193,22 @@ class EDIUploadView(APIView):
             record.error_message = str(exc)[:4000]
             record.processing_finished_at = timezone.now()
             record.save()
-            logger.warning("upload %s failed to parse: %s", record.id, exc)
-            return Response(
-                {"message": "File stored but could not be parsed.", "uploaded_file_id": record.id,
-                 "error": str(exc)},
-                status=status.HTTP_400_BAD_REQUEST,
+
+            logger.warning(
+                "upload %s failed to parse: %s",
+                record.id,
+                exc,
             )
 
-        return Response(
-            {
-                "message": "834 file uploaded successfully",
-                "uploaded_file_id": record.id,
-                "file_path": record.stored_file.name,
-                "status": record.processing_status,
-                "sponsor": record.sponsor_name,
-                "file_date": record.file_date,
-                "segment_count": record.segment_count,
-                "member_loop_count": record.member_loop_count,
-                "is_full_file": record.is_full_file,
-                "validation": result.as_dict(),
-            },
-            status=status.HTTP_201_CREATED,
-        )
-
-
+            return Response(
+                {
+                    "message": "File stored but could not be parsed.",
+                    "uploaded_file_id": record.id,
+                    "error": str(exc),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        
 class ValidateView(APIView):
     """Structural validation on its own, so a user can check a file before converting."""
 

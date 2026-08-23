@@ -11,7 +11,6 @@ one of those columns gets whichever instance came first in the file.
 
 Resolution order here is qualifier, then occurrence, then position.
 """
-
 from __future__ import annotations
 
 import logging
@@ -127,6 +126,7 @@ def build_row(loop, rules: List[dict], header_segments: Optional[List] = None) -
 def iter_excel_rows(loops: Iterable, mappings: List, header_segments: Optional[List] = None):
     """Stream rows so a 27,000 member file never has 27,000 dicts alive at once."""
     rules = [_normalise_rule(rule) for rule in mappings]
+
     for loop in loops:
         yield build_row(loop, rules, header_segments=header_segments)
 
@@ -151,6 +151,7 @@ def build_excel_rows(loops, mappings, header_segments: Optional[List] = None) ->
         )
 
     return list(iter_excel_rows(loops, mappings, header_segments=header_segments))
+
 
 
 def collect_warnings(rows: List[dict]) -> List[str]:
