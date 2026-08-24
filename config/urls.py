@@ -27,4 +27,8 @@ urlpatterns = [
         "api/users/",
         include("users.urls")
     ),
+    path(
+        "api/members/",
+        include("members.urls")
+    ),
 ]
