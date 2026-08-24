@@ -36,8 +36,8 @@ class CustodialParentInline(admin.StackedInline):
 
 @admin.register(Member)
 class MemberAdmin(admin.ModelAdmin):
-    list_display = ("last_name", "first_name", "member_type", "member_id", "masked_ssn_display", "coverage_status", "plan_code")
-    list_filter = ("member_type", "coverage_status", "gender_code", "plan_code", "class_code")
+    list_display = ("last_name", "first_name", "owner", "member_type", "member_id", "masked_ssn_display", "coverage_status", "plan_code")
+    list_filter = ("owner", "member_type", "coverage_status", "gender_code", "plan_code", "class_code")
     # SSN is deliberately absent from search_fields: a search term reaches logs,
     # browser history and the referer header.
     search_fields = ("last_name", "first_name", "member_id", "subscriber_number", "email")

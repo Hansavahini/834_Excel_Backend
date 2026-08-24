@@ -76,6 +76,7 @@ class EDIUploadView(APIView):
         serializer = EDIFileUploadSerializer(data=request.data)
 
         if not serializer.is_valid():
+            logger.error("Upload validation failed: %s", serializer.errors)
             return Response(
                 serializer.errors,
                 status=status.HTTP_400_BAD_REQUEST,
