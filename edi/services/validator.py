@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Iterable, List
+from unittest import result
 
 # Envelope pairs: opener -> (closer, control number element on each side)
 ENVELOPE_PAIRS = (
@@ -163,12 +164,18 @@ def validate_834(segments: Iterable) -> ValidationResult:
         if required not in seen_names:
             result.errors.append("Required segment {name} is missing.".format(name=required))
 
-    if result.member_loop_count == 0 and not result.errors:
-        result.warnings.append("The file is structurally valid but contains no INS member loops.")
+        if result.member_loop_count == 0 and not result.errors:
+          result.warnings.append(
+            "The file is structurally valid but contains no INS member loops."
+        )
 
     if ins_maintenance_codes:
-        # INS03=030 throughout means an audit/compare full file; anything else
-        # means a change-only file. The comparison logic needs to know which.
+        # INS03=030 throughout means an audit/compare full file;
+        # anything else means a change-only file.
         result.is_full_file = ins_maintenance_codes == {"030"}
+
+    # Remove duplicate errors/warnings while preserving order.
+    result.errors = list(dict.fromkeys(result.errors))
+    result.warnings = list(dict.fromkeys(result.warnings))
 
     return result

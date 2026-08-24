@@ -90,8 +90,7 @@ class EDIUploadView(APIView):
         ).first()
 
         if existing:
-            # The unique constraint would raise an IntegrityError here;
-            # a re-upload of an identical file is a normal event, not an error.
+            # Same successfully processed/quarantined file.
             return Response(
                 {
                     "message": "This file has already been uploaded.",
@@ -119,8 +118,12 @@ class EDIUploadView(APIView):
         record.save()
 
         try:
+            # ---------------------------------------
+            # START PROCESSING
+            # ---------------------------------------
             record.processing_status = ProcessingStatus.PARSING
             record.processing_started_at = timezone.now()
+
             record.save(
                 update_fields=[
                     "processing_status",
@@ -130,10 +133,7 @@ class EDIUploadView(APIView):
 
             parser = EDI834Parser(record.stored_file.path)
 
-            # One streaming pass. Materialising every segment to validate and
-            # then walking the list again for the envelope cost ~150 MB on a
-            # 6 MB file; the header is all envelope_facts needs, so capture it
-            # on the way past and let the rest be garbage collected.
+            # Capture only the envelope/header while streaming the entire file.
             header = []
             header_done = False
 
@@ -149,11 +149,24 @@ class EDIUploadView(APIView):
 
                     yield segment
 
+            # ---------------------------------------
+            # VALIDATE 834
+            # ---------------------------------------
             result = validate_834(
                 capture_header(parser.iter_segments())
             )
+
+            # Safety check.
+            if result is None:
+                raise RuntimeError(
+                    "validate_834() returned None instead of a validation result."
+                )
+
             facts = envelope_facts(header)
 
+            # ---------------------------------------
+            # SAVE ENVELOPE INFORMATION
+            # ---------------------------------------
             for field_name in (
                 "interchange_control_number",
                 "group_control_number",
@@ -171,10 +184,14 @@ class EDIUploadView(APIView):
             record.file_date = _parse_x12_date(
                 facts["file_date"]
             )
+
             record.segment_count = result.segment_count
             record.member_loop_count = result.member_loop_count
             record.is_full_file = result.is_full_file
 
+            # ---------------------------------------
+            # SET FINAL STATUS
+            # ---------------------------------------
             record.processing_status = (
                 ProcessingStatus.PARSED
                 if result.is_valid
@@ -186,13 +203,45 @@ class EDIUploadView(APIView):
             )[:4000]
 
             record.processing_finished_at = timezone.now()
+
             record.save()
 
+            # ---------------------------------------
+            # SUCCESS RESPONSE
+            # ---------------------------------------
+            return Response(
+                {
+                    "message": "834 file uploaded and validated successfully.",
+                    "uploaded_file_id": record.id,
+                    "file_path": record.stored_file.name,
+                    "status": record.processing_status,
+                    "duplicate": False,
+                    "is_valid": result.is_valid,
+                    "errors": result.errors,
+                    "warnings": result.warnings,
+                    "segment_count": result.segment_count,
+                    "member_loop_count": result.member_loop_count,
+                    "transaction_count": result.transaction_count,
+                    "is_full_file": result.is_full_file,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        # -------------------------------------------
+        # KNOWN PARSER / FILE ERRORS
+        # -------------------------------------------
         except (EDIParseError, OSError) as exc:
             record.processing_status = ProcessingStatus.FAILED
             record.error_message = str(exc)[:4000]
             record.processing_finished_at = timezone.now()
-            record.save()
+
+            record.save(
+                update_fields=[
+                    "processing_status",
+                    "error_message",
+                    "processing_finished_at",
+                ]
+            )
 
             logger.warning(
                 "upload %s failed to parse: %s",
@@ -204,9 +253,46 @@ class EDIUploadView(APIView):
                 {
                     "message": "File stored but could not be parsed.",
                     "uploaded_file_id": record.id,
+                    "status": record.processing_status,
                     "error": str(exc),
                 },
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------
+        # UNEXPECTED BACKEND ERRORS
+        # -------------------------------------------
+        except Exception as exc:
+            record.processing_status = ProcessingStatus.FAILED
+
+            record.error_message = (
+                f"{type(exc).__name__}: {str(exc)}"
+            )[:4000]
+
+            record.processing_finished_at = timezone.now()
+
+            record.save(
+                update_fields=[
+                    "processing_status",
+                    "error_message",
+                    "processing_finished_at",
+                ]
+            )
+
+            logger.exception(
+                "Unexpected error while processing upload %s",
+                record.id,
+            )
+
+            return Response(
+                {
+                    "message": (
+                        "An unexpected error occurred while processing the file."
+                    ),
+                    "uploaded_file_id": record.id,
+                    "status": record.processing_status,
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         
 class ValidateView(APIView):
