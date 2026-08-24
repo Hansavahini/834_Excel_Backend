@@ -205,6 +205,48 @@ class EDIUploadView(APIView):
             record.processing_finished_at = timezone.now()
 
             record.save()
+            
+            # --- DATABASE SYNC ENGINE HOOK ---
+            # Now that the file is validated and saved, sync its members to the DB.
+            try:
+                from edi.services.x12_834_to_db import convert_834_to_member
+                from edi.services.member_sync import sync_member_loop
+                from edi.services.loop_extractor import StreamingParsedFile
+                
+                sync_parser = EDI834Parser(record.stored_file.path)
+                parsed = StreamingParsedFile(sync_parser.iter_segments())
+                status_date = record.file_date or timezone.now().date()
+                current_subscriber = None
+                
+                for loop in parsed:
+                    try:
+                        parsed_dict = convert_834_to_member(loop)
+                        member, change_type, changed_fields = sync_member_loop(
+                            parsed_dict=parsed_dict,
+                            owner=request.user,
+                            source_file=record,
+                            status_date=status_date,
+                            current_subscriber=current_subscriber if not loop.is_subscriber else None
+                        )
+                        if loop.is_subscriber:
+                            current_subscriber = member
+                    except Exception as loop_e:
+                        logger.error("Failed to sync member loop %s: %s", loop.loop_id, loop_e)
+            except Exception as e:
+                logger.error("Failed to run DB sync engine during upload: %s", e)
+            # ---------------------------------
+            
+            return Response(
+                {
+                    "message": "File uploaded and parsed successfully.",
+                    "uploaded_file_id": record.id,
+                    "status": record.processing_status,
+                    "member_loop_count": record.member_loop_count,
+                    "segment_count": record.segment_count,
+                    "is_full_file": record.is_full_file,
+                },
+                status=status.HTTP_201_CREATED,
+            )
 
             # ---------------------------------------
             # SUCCESS RESPONSE
@@ -428,8 +470,7 @@ class Convert834View(APIView):
         try:
             parser = EDI834Parser(source_path)
             parsed = StreamingParsedFile(parser.iter_segments())
-            # header_segments is a live list that fills before the first loop is
-            # yielded, which is exactly when the row builder first reads it.
+            
             rows = rows_with_warnings(
                 iter_excel_rows(parsed, rules, header_segments=parsed.header)
             )

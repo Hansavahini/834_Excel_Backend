@@ -23,4 +23,8 @@ urlpatterns = [
         "api/edi/",
         include("edi.urls")
     ),
+    path(
+        "api/users/",
+        include("users.urls")
+    ),
 ]
