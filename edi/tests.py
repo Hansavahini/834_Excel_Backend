@@ -207,12 +207,20 @@ class RowBuilderTests(TestCase):
         self.assertEqual(rows[0]["SUBNO"], "HW001")
         self.assertEqual(rows[0]["GROUP"], "GRP9")
 
-    def test_applies_to_blanks_subscriber_columns_on_dependent_rows(self):
+    def test_dependent_rows_inherit_subscriber_scoped_columns(self):
+        """
+        A SUB-scoped rule fills from the family's subscriber on every row.
+
+        The old behaviour blanked the column on dependent rows, which left a
+        flat sheet where a dependent could not be tied to its subscriber
+        without counting rows. The roster layout identifies the family by
+        repeating the subscriber's values down the front columns instead.
+        """
         rules = [{"excel_column": "SUB NAME", "segment": "NM1", "element": "NM103",
                   "qualifier_element": "NM101", "qualifier_value": "IL", "applies_to": "SUB"}]
         rows = build_excel_rows(self.parsed.loops, rules)
         self.assertEqual(rows[0]["SUB NAME"], "SMITH")
-        self.assertEqual(rows[1]["SUB NAME"], "")
+        self.assertEqual(rows[1]["SUB NAME"], "SMITH")
 
     def test_row_count_matches_member_loops(self):
         """The header loop used to add one phantom row to every workbook."""
@@ -285,7 +293,14 @@ class EndpointTests(TestCase):
                 upload = SimpleUploadedFile("t.x12", SAMPLE.encode(), content_type="text/plain")
                 created = self.client.post("/api/edi/upload/", {"file": upload})
                 self.assertEqual(created.status_code, 201, created.content)
-                self.assertEqual(created.json()["member_loop_count"], 2)
+
+                # Upload stores; Validate parses, counts and syncs.
+                validated = self.client.post(
+                    "/api/edi/validate/",
+                    {"uploaded_file_id": created.json()["uploaded_file_id"]},
+                    content_type="application/json",
+                )
+                self.assertEqual(validated.json()["member_loop_count"], 2)
 
                 converted = self.client.post(
                     "/api/edi/convert/",
@@ -320,6 +335,11 @@ class EndpointTests(TestCase):
             with override_settings(MEDIA_ROOT=media):
                 upload = SimpleUploadedFile("t.x12", SAMPLE.encode(), content_type="text/plain")
                 created = self.client.post("/api/edi/upload/", {"file": upload})
+                self.client.post(
+                    "/api/edi/validate/",
+                    {"uploaded_file_id": created.json()["uploaded_file_id"]},
+                    content_type="application/json",
+                )
                 converted = self.client.post(
                     "/api/edi/convert/",
                     {"uploaded_file_id": created.json()["uploaded_file_id"],

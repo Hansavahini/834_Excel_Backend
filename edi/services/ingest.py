@@ -24,7 +24,9 @@ for a 40,000 member interchange.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 
+from django.db import transaction
 from django.utils import timezone
 
 from members.models import CustodialParent
@@ -44,6 +46,59 @@ def sync_custodial_parent(member, loop):
     if not details or not (details.get("last_name") or details.get("first_name")):
         return
     CustodialParent.objects.update_or_create(member=member, defaults=details)
+
+
+# How many member loops share one database transaction.
+#
+# This is the single largest performance number in the project. sync_member_loop
+# is decorated @transaction.atomic, so with nothing around it every loop was its
+# own commit - and on SQLite a commit is an fsync. A 12,000 loop file therefore
+# paid roughly 24,000 fsyncs across the two passes, which measured at 173
+# seconds of wall clock for work that is only a few seconds of actual database
+# time. Batching turns the inner atomic into a savepoint, which costs almost
+# nothing, and commits once per batch instead.
+#
+# 250 rather than "the whole file" because a batch is also the rollback unit if
+# the process dies mid-run, and because a transaction held open for three
+# minutes blocks every writer behind it.
+SYNC_BATCH_SIZE = 250
+
+
+@contextmanager
+def _batched(size=SYNC_BATCH_SIZE, on_commit=None):
+    """
+    Yield a function that opens a transaction and commits it every `size` calls.
+
+    The per-loop @transaction.atomic inside sync_member_loop becomes a savepoint
+    while one of these is open, so a single malformed loop still rolls back
+    alone and the rest of the batch survives - the behaviour the old code got
+    from having no outer transaction at all, at a fraction of the cost.
+    """
+    state = {"atomic": None, "count": 0}
+
+    def close():
+        if state["atomic"] is not None:
+            state["atomic"].__exit__(None, None, None)
+            state["atomic"] = None
+            state["count"] = 0
+            if on_commit is not None:
+                # Progress is reported here and only here. Reporting from
+                # inside the batch would put the update in the same transaction,
+                # so no poller could see it until the batch committed anyway.
+                on_commit()
+
+    def tick():
+        if state["atomic"] is None:
+            state["atomic"] = transaction.atomic()
+            state["atomic"].__enter__()
+        state["count"] += 1
+        if state["count"] >= size:
+            close()
+
+    try:
+        yield tick
+    finally:
+        close()
 
 
 def _new_summary():
@@ -72,13 +127,17 @@ def _record_error(summary, loop_id, exc):
     logger.error("Member sync failed on %s", message)
 
 
-def sync_uploaded_file(record, owner, client=None):
+def sync_uploaded_file(record, owner, client=None, on_progress=None):
     """
     Parse the stored file and reconcile every member loop.
 
     Returns a summary dict. Loop level failures are counted and logged rather
     than aborting the run, because one malformed INS loop in a 40,000 member
     file must not cost the other 39,999.
+
+    on_progress, when given, is called as on_progress(loops_done, phase) so the
+    background runner can report something more useful than a spinner. It is
+    called on every loop and is expected to throttle itself; JobProgress does.
     """
     summary = _new_summary()
     if client is None:
@@ -86,70 +145,92 @@ def sync_uploaded_file(record, owner, client=None):
 
     status_date = record.file_date or timezone.now().date()
     path = record.stored_file.path
+    done = 0
+
+    phase = {"name": "Syncing"}
+
+    def tell(name=None):
+        if name:
+            phase["name"] = name
+        if on_progress is None:
+            return
+        try:
+            on_progress(done, phase["name"])
+        except Exception:  # noqa: BLE001 - reporting must never fail the sync
+            logger.debug("Progress callback failed", exc_info=True)
 
     # ---------------------------------------------------------------
-    # Pass 1 — subscribers only. Remember which loop each one owns so
+    # Pass 1 - subscribers only. Remember which loop each one owns so
     # pass 2 can work out which subscriber was in scope for a dependent
     # without holding the whole file.
     # ---------------------------------------------------------------
     subscriber_by_loop = {}
     first_pass = StreamingParsedFile(EDI834Parser(path).iter_segments())
 
-    for loop in first_pass:
-        summary["loops"] += 1
-        if not bool(getattr(loop, "is_subscriber", True)):
-            continue
-        try:
-            parsed_dict = convert_834_to_member(loop)
-            member, change_type, _ = sync_member_loop(
-                parsed_dict=parsed_dict,
-                owner=owner,
-                source_file=record,
-                status_date=status_date,
-                current_subscriber=None,
-                client=client,
-            )
-            sync_custodial_parent(member, loop)
-            subscriber_by_loop[loop.loop_id] = member
-            summary["synced"] += 1
-            key = str(change_type).lower()
-            if key in summary:
-                summary[key] += 1
-        except Exception as exc:  # noqa: BLE001 - one loop must not stop the file
-            _record_error(summary, getattr(loop, "loop_id", summary["loops"]), exc)
+    phase["name"] = "Syncing subscribers"
+    with _batched(on_commit=tell) as commit_point:
+        for loop in first_pass:
+            summary["loops"] += 1
+            done += 1
+            if not bool(getattr(loop, "is_subscriber", True)):
+                continue
+            try:
+                commit_point()
+                parsed_dict = convert_834_to_member(loop)
+                member, change_type, _ = sync_member_loop(
+                    parsed_dict=parsed_dict,
+                    owner=owner,
+                    source_file=record,
+                    status_date=status_date,
+                    current_subscriber=None,
+                    client=client,
+                )
+                sync_custodial_parent(member, loop)
+                subscriber_by_loop[loop.loop_id] = member
+                summary["synced"] += 1
+                key = str(change_type).lower()
+                if key in summary:
+                    summary[key] += 1
+            except Exception as exc:  # noqa: BLE001 - one loop must not stop the file
+                _record_error(summary, getattr(loop, "loop_id", summary["loops"]), exc)
 
     # ---------------------------------------------------------------
-    # Pass 2 — dependents, attached to the subscriber pass 1 created.
+    # Pass 2 - dependents, attached to the subscriber pass 1 created.
     # ---------------------------------------------------------------
     second_pass = StreamingParsedFile(EDI834Parser(path).iter_segments())
     current_subscriber = None
 
-    for loop in second_pass:
-        if bool(getattr(loop, "is_subscriber", True)):
-            # A subscriber loop that failed in pass 1 is absent from the map,
-            # which correctly clears the scope: better a pending dependent than
-            # one attached to the previous family.
-            current_subscriber = subscriber_by_loop.get(loop.loop_id)
-            continue
+    phase["name"] = "Syncing dependants"
+    with _batched(on_commit=tell) as commit_point:
+        for loop in second_pass:
+            done += 1
+            if bool(getattr(loop, "is_subscriber", True)):
+                # A subscriber loop that failed in pass 1 is absent from the
+                # map, which correctly clears the scope: better a pending
+                # dependent than one attached to the previous family.
+                current_subscriber = subscriber_by_loop.get(loop.loop_id)
+                continue
 
-        try:
-            parsed_dict = convert_834_to_member(loop)
-            member, change_type, _ = sync_member_loop(
-                parsed_dict=parsed_dict,
-                owner=owner,
-                source_file=record,
-                status_date=status_date,
-                current_subscriber=current_subscriber,
-                client=client,
-            )
-            sync_custodial_parent(member, loop)
-            summary["synced"] += 1
-            key = str(change_type).lower()
-            if key in summary:
-                summary[key] += 1
-        except Exception as exc:  # noqa: BLE001
-            _record_error(summary, getattr(loop, "loop_id", "?"), exc)
+            try:
+                commit_point()
+                parsed_dict = convert_834_to_member(loop)
+                member, change_type, _ = sync_member_loop(
+                    parsed_dict=parsed_dict,
+                    owner=owner,
+                    source_file=record,
+                    status_date=status_date,
+                    current_subscriber=current_subscriber,
+                    client=client,
+                )
+                sync_custodial_parent(member, loop)
+                summary["synced"] += 1
+                key = str(change_type).lower()
+                if key in summary:
+                    summary[key] += 1
+            except Exception as exc:  # noqa: BLE001
+                _record_error(summary, getattr(loop, "loop_id", "?"), exc)
 
+    tell("Relinking families")
     summary["relinked"] = relink_pending_dependents(owner, client)
     # The master tables get the same treatment, and after the Member side so
     # the subscriber link it reads from is already correct.

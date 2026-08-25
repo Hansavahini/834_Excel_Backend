@@ -234,6 +234,16 @@ class MemberSerializer(serializers.ModelSerializer):
     record_type = serializers.SerializerMethodField()
     master_record = serializers.SerializerMethodField()
     enrollment_history = serializers.SerializerMethodField()
+    # The self-referencing link, so the browser can group a family without a
+    # second request: dependants carry their subscriber's member pk here.
+    subscriber_id = serializers.IntegerField(read_only=True)
+    subscriber_name = serializers.SerializerMethodField()
+    relationship_display = serializers.CharField(
+        source="get_relationship_code_display", read_only=True
+    )
+
+    def get_subscriber_name(self, obj):
+        return obj.subscriber.full_name if obj.subscriber_id and obj.subscriber else ""
 
     def get_date_of_birth_display(self, obj):
         return display_date(obj.date_of_birth)
@@ -319,6 +329,9 @@ class MemberSerializer(serializers.ModelSerializer):
             "member_type",
             "record_type",
             "relationship_code",
+            "relationship_display",
+            "subscriber_id",
+            "subscriber_name",
             "member_id",
             "subscriber_number",
             "group_number",

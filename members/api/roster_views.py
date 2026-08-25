@@ -33,6 +33,7 @@ from members.services.presence import (
     members_on_date,
     presence_for,
     roster_queryset,
+    spans_for,
 )
 
 MAX_PAGE_SIZE = 200
@@ -264,10 +265,17 @@ class MemberRosterView(APIView):
         rows = []
         totals = {"total": 0, "present": 0, "absent": 0, "in_file": 0}
 
+        # All eligibility spans for the filtered roster, fetched as one
+        # subquery. This replaces the prefetch_related that overflowed
+        # SQLite's bound-variable limit on real-sized files; see spans_for.
+        spans_by_member = spans_for(queryset)
+
         for member in queryset.order_by("last_name", "first_name", "id"):
             appearance = appearances.get(member.id)
             in_file = appearance is not None
-            resolved = presence_for(member, on_date, in_file)
+            resolved = presence_for(
+                member, on_date, in_file, spans=spans_by_member.get(member.id, [])
+            )
 
             totals["total"] += 1
             totals["present" if resolved["presence"] == PRESENT else "absent"] += 1

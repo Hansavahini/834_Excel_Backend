@@ -63,7 +63,7 @@ def owned_masters(request, model):
 
 
 def _prefetched(queryset):
-    return queryset.prefetch_related(
+    return queryset.select_related("subscriber").prefetch_related(
         "daily_statuses__uploaded_file",
         "eligibility_history__source_file",
         "subscriber_record__enrollments__source_file",
@@ -228,7 +228,41 @@ class MemberSearchView(APIView):
         )
 
     def _serialise(self, members):
-        return MemberSerializer(members, many=True).data
+        return MemberSerializer(self._expand_families(members), many=True).data
+
+    def _expand_families(self, members):
+        """
+        Widen a hit to the family it belongs to.
+
+        The Members screen shows a subscriber together with their dependants,
+        selected by radio button, so a search that matches one person has to
+        return everyone who shares that person's subscriber. A dependant hit
+        pulls in its subscriber and siblings; a subscriber hit pulls in its
+        dependants. Ordering puts each subscriber first, then that family's
+        dependants, so the screen can group without re-sorting.
+        """
+        by_id = {member.id: member for member in members}
+        subscriber_ids = set()
+        for member in members:
+            if member.member_type == "SUB":
+                subscriber_ids.add(member.id)
+            elif member.subscriber_id:
+                subscriber_ids.add(member.subscriber_id)
+
+        if subscriber_ids:
+            request = self.request
+            family = _prefetched(owned_members(request)).filter(
+                Q(pk__in=subscriber_ids) | Q(subscriber_id__in=subscriber_ids)
+            )
+            for member in family:
+                by_id.setdefault(member.id, member)
+
+        def family_key(member):
+            head = member.id if member.member_type == "SUB" else (member.subscriber_id or 0)
+            # Subscriber first inside the family, then dependants by name.
+            return (head, member.member_type != "SUB", member.last_name, member.first_name, member.id)
+
+        return sorted(by_id.values(), key=family_key)
 
 
 class MemberDetailView(APIView):

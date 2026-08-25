@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Iterable, List, Optional
 
 from django.conf import settings
@@ -43,6 +44,43 @@ EXCEL_DATE_FORMAT = getattr(settings, "EXCEL_DATE_FORMAT", "MM-DD-YYYY")
 TEXT_FORMAT = "@"
 
 MAX_SHEET_ROWS = 1_048_576  # Excel's hard limit, worth failing loudly on
+
+# Excel's own hard limit on a cell. Longer than this and openpyxl writes a file
+# Excel refuses to open, which is worse than a truncated cell with a marker.
+MAX_CELL_CHARS = 32_767
+
+# Characters XML 1.0 cannot represent, which openpyxl rejects with
+# IllegalCharacterError. Real 834 files contain them: some sponsors pad fixed
+# width extracts with NUL, some use 0x1C/0x1D/0x1E as the segment, element and
+# component separators (the X12 standard permits it), and a file that has been
+# through a mainframe EBCDIC conversion can carry almost anything in a name
+# field. openpyxl raises at save() time, long after the last useful stack frame,
+# and IllegalCharacterError does not inherit from ValueError - so the old
+# converter's `except (EDIParseError, ValueError, OSError)` let it straight
+# through as a 500 with the file stranded at CONVERTING.
+_ILLEGAL_XML = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f\ud800-\udfff\ufdd0-\ufddf\ufffe\uffff]"
+)
+
+
+def sanitize_cell(value):
+    """
+    Make one value safe to write, without pretending it was clean.
+
+    Control characters are replaced with a space rather than deleted, so a name
+    field padded with NUL reads as two words instead of silently running them
+    together and looking like real data. Over-long values are cut at Excel's
+    limit with a visible marker, for the same reason.
+    """
+    if value is None or isinstance(value, (int, float, bool, date, datetime)):
+        return value
+
+    text = value if isinstance(value, str) else str(value)
+    if _ILLEGAL_XML.search(text):
+        text = _ILLEGAL_XML.sub(" ", text)
+    if len(text) > MAX_CELL_CHARS:
+        text = text[: MAX_CELL_CHARS - 15] + "...[truncated]"
+    return text
 
 
 @dataclass
@@ -90,15 +128,15 @@ def _typed_cell(sheet, value, kind: str):
             return cell
         # Unparseable. Write what the file said rather than a blank, so the
         # problem is visible to whoever has to fix the mapping.
-        return WriteOnlyCell(sheet, value="" if value is None else str(value))
+        return WriteOnlyCell(sheet, value=sanitize_cell("" if value is None else str(value)))
 
     if kind == KIND_TEXT:
-        cell = WriteOnlyCell(sheet, value="" if value is None else str(value))
+        cell = WriteOnlyCell(sheet, value=sanitize_cell("" if value is None else str(value)))
         cell.number_format = TEXT_FORMAT
         cell.alignment = Alignment(horizontal="left")
         return cell
 
-    return value
+    return sanitize_cell(value)
 
 
 def generate_excel(
@@ -137,7 +175,7 @@ def generate_excel(
     for text in headers:
         from openpyxl.cell import WriteOnlyCell
 
-        cell = WriteOnlyCell(sheet, value=text)
+        cell = WriteOnlyCell(sheet, value=sanitize_cell(text))
         cell.font = bold
         header_cells.append(cell)
     sheet.append(header_cells)
@@ -167,7 +205,7 @@ def generate_excel(
                 ]
             )
         else:
-            sheet.append([row_data.get(header, "") for header in headers])
+            sheet.append([sanitize_cell(row_data.get(header, "")) for header in headers])
         row_count += 1
         if row_count >= MAX_SHEET_ROWS - 1:
             raise ValueError(

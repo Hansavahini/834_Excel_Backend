@@ -75,6 +75,19 @@ class MappingTemplate(models.Model):
         ),
     )
     created_at = models.DateTimeField(auto_now_add=True)
+    column_layout = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Every column of the workbook, in order, mapped or not. Kept apart "
+            "from the MappingDetail rows because the two answer different "
+            "questions: a detail says how a column is filled, and this says the "
+            "column exists at all. Columns such as LOCAL and CLASS are "
+            "deliberately unmapped and filled in downstream by hand, and "
+            "un-mapping a column must leave it on the screen to be re-mapped "
+            "rather than deleting it from the layout."
+        ),
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

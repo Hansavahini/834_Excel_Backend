@@ -102,15 +102,41 @@ def resolve(rule: dict, segments: List) -> str:
     return ""
 
 
-def build_row(loop, rules: List[dict], header_segments: Optional[List] = None) -> dict:
-    """Build one Excel row from one member loop."""
+def build_row(
+    loop,
+    rules: List[dict],
+    header_segments: Optional[List] = None,
+    subscriber_loop=None,
+) -> dict:
+    """
+    Build one Excel row from one member loop.
+
+    subscriber_loop is the most recent subscriber loop seen before this one.
+    On a dependent row, rules scoped applies_to=SUB resolve against it, so the
+    LAST NAME / FIRST NAME / SSN / SEX / DOB and address columns at the front
+    of the sheet carry the subscriber's values on every row of the family —
+    which is how the flat roster layout identifies whose dependent each DEP
+    row is. They used to come out blank on dependent rows, leaving a sheet
+    where a dependent could not be tied to a subscriber without counting rows.
+    """
     row: dict = {}
     warnings: List[str] = []
     applies = loop.applies_to  # SUB or DEP
 
     for rule in rules:
         if rule["applies_to"] not in ("BOTH", applies):
-            row[rule["excel_column"]] = ""
+            # A SUB-scoped column on a dependent row is filled from that
+            # dependent's subscriber. A DEP-scoped column on a subscriber row
+            # stays blank, as before.
+            if (
+                applies == "DEP"
+                and rule["applies_to"] == "SUB"
+                and subscriber_loop is not None
+            ):
+                value = resolve(rule, subscriber_loop.segments)
+                row[rule["excel_column"]] = apply_transform(value, rule["transform"])
+            else:
+                row[rule["excel_column"]] = ""
             continue
 
         value = resolve(rule, loop.segments)
@@ -154,11 +180,27 @@ def column_kinds(mappings: List) -> dict:
 
 
 def iter_excel_rows(loops: Iterable, mappings: List, header_segments: Optional[List] = None):
-    """Stream rows so a 27,000 member file never has 27,000 dicts alive at once."""
+    """
+    Stream rows so a 27,000 member file never has 27,000 dicts alive at once.
+
+    The current subscriber loop is carried forward as the stream advances. An
+    834 lists each subscriber followed by that subscriber's dependents, so the
+    most recently seen subscriber is, by the structure of the transaction, the
+    subscriber every following dependent belongs to — until the next INS*Y
+    starts a new family. Holding one loop is all the memory this costs.
+    """
     rules = [_normalise_rule(rule) for rule in mappings]
+    current_subscriber = None
 
     for loop in loops:
-        yield build_row(loop, rules, header_segments=header_segments)
+        if loop.is_subscriber:
+            current_subscriber = loop
+        yield build_row(
+            loop,
+            rules,
+            header_segments=header_segments,
+            subscriber_loop=current_subscriber,
+        )
 
 
 def build_excel_rows(loops, mappings, header_segments: Optional[List] = None) -> List[dict]:

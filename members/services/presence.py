@@ -63,15 +63,44 @@ def covering_span(spans: Iterable[MemberEligibilityHistory], on_date: date):
     return covering, latest
 
 
-def presence_for(member: Member, on_date: date, in_file: bool):
+def spans_for(member_queryset):
+    """
+    member_id -> [MemberEligibilityHistory] for every member in the queryset,
+    in exactly one SQL query with zero bound parameters.
+
+    This exists because prefetch_related on the roster queryset was the crash.
+    Django's prefetch machinery collects the primary key of every member the
+    outer query returned and issues WHERE member_id IN (?, ?, ... x N) with one
+    bound variable per key. SQLite caps bound variables (999 on the builds most
+    distributions ship), so the roster worked in development and failed the day
+    a real 834 put a few thousand members in the table. Passing the queryset
+    itself as member__in makes the database run it as a subquery — the member
+    ids never leave the database, so there is no variable list to overflow, and
+    the same SQL is what Postgres would want anyway.
+    """
+    rows = MemberEligibilityHistory.objects.filter(
+        member__in=member_queryset.values("pk")
+    ).order_by("member_id", "insurance_line_code", "-effective_date")
+    grouped: dict = {}
+    for row in rows:
+        grouped.setdefault(row.member_id, []).append(row)
+    return grouped
+
+
+def presence_for(member: Member, on_date: date, in_file: bool, spans=None):
     """
     Resolve one member's presence on one date.
 
     Returns a dict rather than a tuple because the caller serialises it straight
     to JSON and a positional tuple here has already caused one off-by-one in
     this codebase.
+
+    spans, when given, is the member's eligibility rows already in hand — see
+    spans_for above. Falling back to the related manager is kept for callers
+    that resolve one member at a time, where a single extra query is fine.
     """
-    spans = list(member.eligibility_history.all())
+    if spans is None:
+        spans = list(member.eligibility_history.all())
     covering, latest = covering_span(spans, on_date)
 
     if covering is not None:
@@ -132,11 +161,15 @@ def roster_queryset(owner=None):
     queryset = Member.objects.all()
     if owner is not None:
         queryset = queryset.filter(owner=owner)
+    # No prefetch_related here, on purpose. Prefetching eligibility_history
+    # across the whole roster is what raised "too many SQL variables" on
+    # SQLite once the member count passed the bound-parameter cap. The roster
+    # view loads the spans itself through spans_for(), which is one subquery
+    # instead of one IN list per thousand members.
     return (
         queryset.filter(
             Q(eligibility_history__isnull=False) | Q(daily_statuses__isnull=False)
         )
         .distinct()
         .select_related("subscriber")
-        .prefetch_related("eligibility_history")
     )

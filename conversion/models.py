@@ -59,6 +59,16 @@ class ConversionHistory(models.Model):
         blank=True,
         help_text="TEMPLATE when a saved template drove the run, INLINE when rules came with the request.",
     )
+    result_headers = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "The column layout of the workbook this run produced, in order. Stored "
+            "next to mapping_snapshot because the two together are what decides "
+            "whether a re-run would produce a different file: adding an unmapped "
+            "column changes the workbook without changing a single rule."
+        ),
+    )
     generated_file = models.ForeignKey(
         GeneratedFile, null=True, blank=True, on_delete=models.PROTECT, related_name="conversions"
     )

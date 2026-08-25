@@ -9,6 +9,7 @@ The numbering in the docstrings matches the Required Tests list in the brief.
 """
 
 import os
+import json
 import tempfile
 
 from django.contrib.auth import get_user_model
@@ -240,6 +241,21 @@ class QualifierResolutionTests(TestCase):
         self.assertNotEqual(rows[0]["EFF"], rows[0]["TERM"])
 
 
+def upload_and_validate(client, name, content):
+    """Upload then validate through the API, as the portal now does in two steps."""
+    created = client.post(
+        "/api/edi/upload/",
+        {"file": SimpleUploadedFile(name, content.encode())},
+    ).json()
+    if created.get("uploaded_file_id"):
+        client.post(
+            "/api/edi/validate/",
+            json.dumps({"uploaded_file_id": created["uploaded_file_id"]}),
+            content_type="application/json",
+        )
+    return created
+
+
 class ApiRegressionTests(TestCase):
     """Tests 9 to 19 — the endpoints, under a real session."""
 
@@ -248,10 +264,28 @@ class ApiRegressionTests(TestCase):
         self.client.force_login(self.user)
 
     def upload(self, content=VALID_834, name="t.x12"):
-        return self.client.post(
+        """Upload then validate, matching the portal's two-step flow."""
+        created = self.client.post(
             "/api/edi/upload/",
             {"file": SimpleUploadedFile(name, content.encode(), content_type="text/plain")},
         )
+        body = created.json()
+        if created.status_code == 201 and body.get("uploaded_file_id"):
+            validated = self.client.post(
+                "/api/edi/validate/",
+                json.dumps({"uploaded_file_id": body["uploaded_file_id"]}),
+                content_type="application/json",
+            )
+            merged = dict(body)
+            vbody = validated.json()
+            merged["status"] = vbody.get("status", merged.get("status"))
+            merged["is_valid"] = vbody.get("is_valid")
+            merged["errors"] = vbody.get("errors", [])
+            merged["warnings"] = vbody.get("warnings", [])
+            merged["member_loop_count"] = vbody.get("member_loop_count")
+            merged["members_synced"] = vbody.get("members_synced", 0)
+            created.json = lambda m=merged: m
+        return created
 
     def convert(self, file_id, mappings, columns=None):
         payload = {"uploaded_file_id": file_id, "mappings": mappings}
@@ -638,10 +672,7 @@ class MappingVersionTests(TestCase):
                     content_type="application/json",
                 )
 
-                upload = self.client.post(
-                    "/api/edi/upload/",
-                    {"file": SimpleUploadedFile("t.x12", VALID_834.encode())},
-                ).json()
+                upload = upload_and_validate(self.client, "t.x12", VALID_834)
 
                 converted = self.client.post(
                     "/api/edi/convert/",
@@ -688,10 +719,7 @@ class OrphanDependentTests(TestCase):
         with tempfile.TemporaryDirectory() as media:
             with override_settings(MEDIA_ROOT=media):
                 orphan_file = build_834([ORPHAN_DEPENDENT], control="0001")
-                self.client.post(
-                    "/api/edi/upload/",
-                    {"file": SimpleUploadedFile("orphan.x12", orphan_file.encode())},
-                )
+                upload_and_validate(self.client, "orphan.x12", orphan_file)
 
                 member = Member.objects.get(ssn_fingerprint=ssn_fingerprint("777889999"))
                 self.assertEqual(member.member_type, "DEP")
@@ -701,23 +729,11 @@ class OrphanDependentTests(TestCase):
     def test_the_subscriber_arriving_later_relinks_the_dependent(self):
         with tempfile.TemporaryDirectory() as media:
             with override_settings(MEDIA_ROOT=media):
-                self.client.post(
-                    "/api/edi/upload/",
-                    {
-                        "file": SimpleUploadedFile(
-                            "orphan.x12",
-                            build_834([ORPHAN_DEPENDENT], control="0001").encode(),
-                        )
-                    },
+                upload_and_validate(
+                    self.client, "orphan.x12", build_834([ORPHAN_DEPENDENT], control="0001")
                 )
-                self.client.post(
-                    "/api/edi/upload/",
-                    {
-                        "file": SimpleUploadedFile(
-                            "family.x12",
-                            build_834([SUBSCRIBER], control="0002").encode(),
-                        )
-                    },
+                upload_and_validate(
+                    self.client, "family.x12", build_834([SUBSCRIBER], control="0002")
                 )
 
                 dependent = Member.objects.get(ssn_fingerprint=ssn_fingerprint("777889999"))
@@ -731,10 +747,7 @@ class OrphanDependentTests(TestCase):
     def test_dependent_after_subscriber_is_linked_in_one_file(self):
         with tempfile.TemporaryDirectory() as media:
             with override_settings(MEDIA_ROOT=media):
-                self.client.post(
-                    "/api/edi/upload/",
-                    {"file": SimpleUploadedFile("t.x12", VALID_834.encode())},
-                )
+                upload_and_validate(self.client, "t.x12", VALID_834)
                 dependent = Member.objects.get(ssn_fingerprint=ssn_fingerprint("444556666"))
                 subscriber = Member.objects.get(ssn_fingerprint=ssn_fingerprint("111223333"))
                 self.assertEqual(dependent.member_type, "DEP")

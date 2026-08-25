@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import os
+import sys
 from pathlib import Path
 
 try:  # optional, only needed for the split-origin dev setup
@@ -146,7 +147,15 @@ SESSION_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_HTTPONLY = False  # the SPA reads this cookie to set X-CSRFToken
 SESSION_COOKIE_AGE = env_int('SESSION_COOKIE_AGE', 60 * 60 * 8)
-SESSION_SAVE_EVERY_REQUEST = True
+
+# Off by default now. It was on so that an active user's session kept sliding
+# forward, which is a reasonable thing to want - but it makes every single
+# request a database write, and the conversion screen polls job status while
+# work is running. That turned a progress bar into several session-table writes
+# per second, contending with the background worker for SQLite's single writer.
+# Sessions still expire on SESSION_COOKIE_AGE from login; set
+# SESSION_SAVE_EVERY_REQUEST=1 to restore sliding expiry if a client asks for it.
+SESSION_SAVE_EVERY_REQUEST = env_bool('SESSION_SAVE_EVERY_REQUEST', False)
 
 
 # Application definition
@@ -240,7 +249,40 @@ else:
                 # WAL lets the read-heavy dashboard queries run while an upload
                 # is still writing member rows, which is the shape of every
                 # concurrent request this portal actually sees.
-                'init_command': 'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;',
+                # synchronous=NORMAL is the documented and safe pairing with
+                # WAL: a commit no longer fsyncs, and the only exposure is that
+                # the last few committed transactions could be lost if the
+                # machine loses power (not if the process crashes - WAL still
+                # covers that). For a portal that re-derives its member tables
+                # from files it still holds on disk, that trade is worth
+                # roughly a third of the sync's wall clock. Set
+                # SQLITE_SYNCHRONOUS=FULL to give it back.
+                'init_command': (
+                    'PRAGMA journal_mode=WAL;'
+                    ' PRAGMA foreign_keys=ON;'
+                    ' PRAGMA synchronous={sync};'
+                    ' PRAGMA temp_store=MEMORY;'
+                ).format(sync=os.environ.get('SQLITE_SYNCHRONOUS', 'NORMAL')),
+                # ---------------------------------------------------------
+                # BEGIN IMMEDIATE, not BEGIN DEFERRED. This one word is the
+                # difference between a member sync that completes and one that
+                # logs "database is locked" a thousand times.
+                #
+                # A deferred transaction takes a shared read lock first and
+                # upgrades to a write lock when it first writes. If any other
+                # connection has written in between, SQLite returns SQLITE_BUSY
+                # *immediately* and does not invoke the busy handler at all -
+                # deliberately, because waiting there could deadlock two
+                # upgraders against each other. So `timeout` above, all thirty
+                # seconds of it, simply does not apply to the one case that
+                # actually happens here: a background sync writing while a
+                # polling request writes a session row.
+                #
+                # IMMEDIATE takes the write lock at BEGIN, where the busy
+                # handler does apply, so a contending writer waits its turn
+                # instead of failing instantly.
+                # ---------------------------------------------------------
+                'transaction_mode': os.environ.get('SQLITE_TRANSACTION_MODE', 'IMMEDIATE'),
             },
         }
     }
@@ -317,6 +359,37 @@ FILE_UPLOAD_MAX_NUMBER_FIELDS = env_int("FILE_UPLOAD_MAX_NUMBER_FIELDS", 1000)
 # API output and the browser. Kept in one place so a future change is one edit.
 DISPLAY_DATE_FORMAT = os.environ.get("DISPLAY_DATE_FORMAT", "%m-%d-%Y")
 EXCEL_DATE_FORMAT = os.environ.get("EXCEL_DATE_FORMAT", "MM-DD-YYYY")
+
+# --- Background work -------------------------------------------------------
+#
+# Validation and conversion run off the request thread. See
+# edi/services/runner.py for why this is a thread pool and not Celery.
+#
+# EDI_WORKER_THREADS is small deliberately: conversion is CPU-bound inside
+# openpyxl and the member sync is I/O-bound on the database, so running many at
+# once on one box makes each of them slower without finishing any sooner. Raise
+# it only alongside a real measurement.
+EDI_WORKER_THREADS = env_int("EDI_WORKER_THREADS", 2)
+
+# Run jobs inline instead of on the pool.
+#
+# On under the test runner, and only there by default. Django's TestCase wraps
+# each test in a transaction that a worker thread's own connection cannot see,
+# so a threaded job in a test either deadlocks or asserts against an empty
+# database - neither of which says anything about the code under test. Inline
+# execution keeps the tests testing the pipeline rather than the scheduler.
+#
+# It is also a genuine escape hatch: set EDI_RUN_JOBS_INLINE=1 to reproduce a
+# conversion in the foreground with a stack trace when something is wrong in
+# production.
+EDI_RUN_JOBS_INLINE = env_bool("EDI_RUN_JOBS_INLINE", False) or any(
+    arg in ("test", "pytest") for arg in sys.argv
+)
+
+# A RUNNING job that has not reported in for this long is treated as abandoned
+# and its file is released. Must be comfortably larger than the heartbeat.
+EDI_JOB_STALE_SECONDS = env_int("EDI_JOB_STALE_SECONDS", 180)
+EDI_JOB_HEARTBEAT_SECONDS = env_int("EDI_JOB_HEARTBEAT_SECONDS", 5)
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [

@@ -27,7 +27,8 @@ import os
 from datetime import datetime
 
 from django.db import transaction
-from django.http import FileResponse
+from django.db.models import F
+from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
@@ -48,20 +49,23 @@ from mapping.models import SegmentElement
 from members.models import Dependant, Subscriber
 from users.tenancy import resolve_client, scope_to_client
 
-from edi.services.excel_generator import generate_excel
+from edi.models import ACTIVE_STATES, JobKind, JobState, ProcessingJob
 from edi.services.file_service import UnsafePathError, get_file_path
-from edi.services.ingest import sync_uploaded_file
-from edi.services.loop_extractor import StreamingParsedFile
 from edi.services.mapping_store import (
     get_mappings,
     get_template,
     headers_for,
-    lock_template,
+    layout_for,
     save_mapping,
+    save_mappings,
 )
-from edi.services.parser import EDI834Parser, EDIParseError, envelope_facts
-from edi.services.row_builder import column_kinds, iter_excel_rows
-from edi.services.validator import validate_834
+from edi.services.runner import enqueue, reap_stale
+from edi.services.tasks import (
+    conversion_fingerprint,
+    mapping_snapshot,
+    run_conversion,
+    run_validation,
+)
 
 from .serializers import ConvertRequestSerializer, EDIFileUploadSerializer, MappingSerializer
 
@@ -104,58 +108,6 @@ def display_date(value):
         return str(value)
 
 
-def _parse_x12_date(value: str):
-    value = (value or "").strip()
-    if len(value) == 6:  # GS04 in some 004010 files is YYMMDD
-        value = "20" + value
-    if len(value) != 8 or not value.isdigit():
-        return None
-    try:
-        return datetime.strptime(value, "%Y%m%d").date()
-    except ValueError:
-        return None
-
-
-def _mapping_snapshot(rules):
-    """
-    The rules that ran, flattened to plain JSON.
-
-    Accepts either MappingDetail rows or the dicts the API takes, because both
-    reach the converter and both have to be recordable. Stored on the history
-    row so "which mapping produced this workbook" has an answer that does not
-    depend on the template still existing in its original form.
-    """
-    snapshot = []
-    for rule in rules:
-        if isinstance(rule, dict):
-            snapshot.append(
-                {
-                    "excel_column": rule.get("excel_column", ""),
-                    "segment": rule.get("segment", ""),
-                    "element": rule.get("element", ""),
-                    "qualifier_element": rule.get("qualifier_element", "") or "",
-                    "qualifier_value": rule.get("qualifier_value", "") or "",
-                    "occurrence": rule.get("occurrence") or 1,
-                    "applies_to": rule.get("applies_to") or "BOTH",
-                    "transform": rule.get("transform") or "NONE",
-                }
-            )
-        else:
-            snapshot.append(
-                {
-                    "excel_column": rule.excel_column,
-                    "segment": rule.segment,
-                    "element": rule.element,
-                    "qualifier_element": rule.qualifier_element or "",
-                    "qualifier_value": rule.qualifier_value or "",
-                    "occurrence": rule.occurrence or 1,
-                    "applies_to": rule.applies_to,
-                    "transform": rule.transform,
-                }
-            )
-    return snapshot
-
-
 def owned_uploads(request, client):
     """Every uploaded-file query in this module starts here."""
     return scope_to_client(
@@ -169,7 +121,7 @@ def owned_generated(request, client):
     )
 
 
-def _upload_payload(record):
+def _upload_payload(record, current_fingerprint=None):
     """
     One uploaded file, complete enough that a browser refresh restores the screen.
 
@@ -182,6 +134,24 @@ def _upload_payload(record):
     """
     latest = record.generated_files.order_by("-generated_at").first()
     status = canonical_status(record.processing_status)
+
+    jobs = list(record.jobs.order_by("-created_at")[:4])
+    active = next((job for job in jobs if job.state in ACTIVE_STATES), None)
+    last = jobs[0] if jobs else None
+
+    last_conversion = (
+        record.conversions.filter(generated_file__isnull=False)
+        .order_by("-created_at")
+        .first()
+    )
+    stale = False
+    if last_conversion is not None and current_fingerprint is not None:
+        stale = (
+            conversion_fingerprint(
+                last_conversion.result_headers, last_conversion.mapping_snapshot or []
+            )
+            != current_fingerprint
+        )
     return {
         "id": record.id,
         "uploaded_file_id": record.id,
@@ -218,11 +188,23 @@ def _upload_payload(record):
         "preview_url": (
             "/api/edi/download/{pk}/preview/".format(pk=latest.id) if latest else None
         ),
+        "generated_file_size_bytes": latest.file_size_bytes if latest else None,
         # Part 8: preview and download are different endpoints because they are
         # different jobs. One returns a readable excerpt, the other returns the
         # bytes that arrived.
         "source_url": "/api/edi/files/{pk}/preview/".format(pk=record.id),
         "source_download_url": "/api/edi/files/{pk}/download/".format(pk=record.id),
+        # The in-flight job for this file, if any. This is what lets a browser
+        # refresh mid-validation reattach to the run and keep showing progress
+        # instead of presenting a file that looks frozen at VALIDATING.
+        "active_job": active.as_dict() if active else None,
+        "last_job": last.as_dict() if last and not active else None,
+        # True when the workbook on disk was produced by a different mapping
+        # from the one currently saved. The screen uses it to say "mapping
+        # changed - reconvert" rather than leaving the user to guess whether the
+        # file they are about to send a client reflects the edit they just made.
+        "mapping_stale": stale,
+        "converted_mapping_version": last_conversion.mapping_version if last_conversion else None,
     }
 
 
@@ -337,176 +319,30 @@ class EDIUploadView(APIView):
             record.save()
             retried = False
 
-        return self._process(request, record, client, retried)
-
-    def _process(self, request, record, client, retried):
-        try:
-            record.processing_status = ProcessingStatus.VALIDATING
-            record.processing_started_at = timezone.now()
-            record.save(update_fields=["processing_status", "processing_started_at"])
-
-            parser = EDI834Parser(record.stored_file.path)
-
-            header = []
-            header_done = False
-
-            def capture_header(stream):
-                nonlocal header_done
-                for segment in stream:
-                    if not header_done:
-                        if segment.name == "INS":
-                            header_done = True
-                        else:
-                            header.append(segment)
-                    yield segment
-
-            result = validate_834(capture_header(parser.iter_segments()))
-
-            if result is None:
-                raise RuntimeError(
-                    "validate_834() returned None instead of a validation result."
-                )
-
-            facts = envelope_facts(header)
-
-            for field_name in (
-                "interchange_control_number",
-                "group_control_number",
-                "transaction_set_control_number",
-                "sender_id",
-                "receiver_id",
-                "sponsor_name",
-            ):
-                setattr(record, field_name, facts[field_name][:60])
-
-            record.file_date = _parse_x12_date(facts["file_date"])
-            record.segment_count = result.segment_count
-            record.member_loop_count = result.member_loop_count
-            record.is_full_file = result.is_full_file
-
-            record.processing_status = (
-                ProcessingStatus.VALIDATED
-                if result.is_valid
-                else ProcessingStatus.QUARANTINED
-            )
-            # Persisted, not just returned. This is the half of Issue 1 that
-            # made a refresh destructive: the answer existed for the duration of
-            # one HTTP response and was then discarded.
-            record.validation_errors = list(result.errors)[:200]
-            record.validation_warnings = list(result.warnings)[:200]
-            record.validated_at = timezone.now()
-            record.error_message = "\n".join(result.errors)[:4000]
-            record.processing_finished_at = timezone.now()
-            record.save()
-
-            # ---------------------------------------------------------
-            # DATABASE SYNC ENGINE — valid files only.
-            #
-            # The old code ran this unconditionally, right after setting the
-            # status to QUARANTINED. So an 835, a truncated interchange or a
-            # file with mismatched control numbers still wrote Member and
-            # MemberDailyStatus rows, and those rows then answered eligibility
-            # questions as if the file had been trustworthy. Quarantine that
-            # does not actually quarantine anything is worse than none, because
-            # it reads as a control that is working.
-            # ---------------------------------------------------------
-            sync_summary = {"synced": 0, "failed": 0, "loops": 0, "errors": []}
-            if result.is_valid:
-                try:
-                    sync_summary = sync_uploaded_file(record, request.user, client)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Member sync failed for upload %s", record.id)
-                    sync_summary["errors"] = [
-                        "{k}: {e}".format(k=type(exc).__name__, e=exc)
-                    ]
-            else:
-                logger.warning(
-                    "Upload %s failed validation; not synced to the member tables.",
-                    record.id,
-                )
-
-            return Response(
-                {
-                    "message": (
-                        "File uploaded and parsed successfully."
-                        if result.is_valid
-                        else "File was rejected by 834 validation and has been quarantined."
-                    ),
-                    "uploaded_file_id": record.id,
-                    "status": canonical_status(record.processing_status),
-                    "member_loop_count": record.member_loop_count,
-                    "segment_count": record.segment_count,
-                    "is_full_file": record.is_full_file,
-                    "file_path": record.stored_file.name,
-                    "file_date": record.file_date,
-                    "file_date_display": display_date(record.file_date),
-                    "duplicate": False,
-                    "retried": retried,
-                    "is_valid": result.is_valid,
-                    "errors": result.errors[:25],
-                    "warnings": result.warnings[:25],
-                    "transaction_count": result.transaction_count,
-                    "members_synced": sync_summary.get("synced", 0),
-                    "members_failed": sync_summary.get("failed", 0),
-                    "sync_errors": sync_summary.get("errors", [])[:10],
-                },
-                status=status.HTTP_201_CREATED,
-            )
-
-        except (EDIParseError, OSError) as exc:
-            record.processing_status = ProcessingStatus.FAILED
-            record.error_message = str(exc)[:4000]
-            record.validation_errors = [str(exc)[:500]]
-            record.validated_at = timezone.now()
-            record.processing_finished_at = timezone.now()
-            record.save(
-                update_fields=[
-                    "processing_status",
-                    "error_message",
-                    "validation_errors",
-                    "validated_at",
-                    "processing_finished_at",
-                ]
-            )
-            logger.warning("upload %s failed to parse: %s", record.id, exc)
-            return Response(
-                {
-                    "message": "File stored but could not be parsed.",
-                    "uploaded_file_id": record.id,
-                    "status": canonical_status(record.processing_status),
-                    "is_valid": False,
-                    "error": str(exc),
-                    "retryable": True,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        except Exception as exc:  # noqa: BLE001
-            record.processing_status = ProcessingStatus.FAILED
-            record.error_message = "{t}: {e}".format(t=type(exc).__name__, e=exc)[:4000]
-            record.validation_errors = [record.error_message[:500]]
-            record.validated_at = timezone.now()
-            record.processing_finished_at = timezone.now()
-            record.save(
-                update_fields=[
-                    "processing_status",
-                    "error_message",
-                    "validation_errors",
-                    "validated_at",
-                    "processing_finished_at",
-                ]
-            )
-            logger.exception("Unexpected error while processing upload %s", record.id)
-            return Response(
-                {
-                    "message": "An unexpected error occurred while processing the file.",
-                    "uploaded_file_id": record.id,
-                    "status": canonical_status(record.processing_status),
-                    "is_valid": False,
-                    "retryable": True,
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+        # -----------------------------------------------------------------
+        # Upload now ends here, deliberately.
+        #
+        # It used to continue into streaming validation and the member sync
+        # engine, in this request. On a real-sized 834 — tens of thousands of
+        # INS loops — the sync alone runs for minutes, so the browser sat on
+        # "Uploading…" until a proxy or a person gave up, and a page refresh
+        # then revealed that the file had in fact been stored the whole time.
+        # Storing the bytes is fast; everything slow is now behind the
+        # Validate button, where the user has asked for it and can watch it.
+        # -----------------------------------------------------------------
+        return Response(
+            {
+                "message": "File uploaded. Click Validate to run 834 validation.",
+                "uploaded_file_id": record.id,
+                "status": canonical_status(record.processing_status),
+                "file_path": record.stored_file.name,
+                "file_size_bytes": record.file_size_bytes,
+                "duplicate": False,
+                "retried": retried,
+                "is_valid": None,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class UploadListView(APIView):
@@ -519,13 +355,23 @@ class UploadListView(APIView):
     """
 
     def get(self, request):
+        reap_stale()
         client = resolve_client(request)
         records = (
             owned_uploads(request, client)
-            .prefetch_related("generated_files")
+            .prefetch_related("generated_files", "jobs", "conversions")
             .order_by("-uploaded_at")[:200]
         )
-        return Response([_upload_payload(record) for record in records])
+
+        # Worked out once for the whole list. Per row it would be one hash of
+        # the same thirty rules per file on screen.
+        details = get_mappings(request.user, None, client=client)
+        current = (
+            conversion_fingerprint(headers_for(details), mapping_snapshot(details))
+            if details
+            else None
+        )
+        return Response([_upload_payload(record, current) for record in records])
 
 
 class UploadSourceView(APIView):
@@ -567,8 +413,55 @@ class UploadSourceView(APIView):
         )
 
 
+def _active_job(record, kind):
+    """The queued or running job of this kind for this file, if there is one."""
+    return (
+        ProcessingJob.objects.filter(
+            uploaded_file=record, kind=kind, state__in=ACTIVE_STATES
+        )
+        .order_by("-created_at")
+        .first()
+    )
+
+
+def _job_response(job, http_status=status.HTTP_202_ACCEPTED):
+    """
+    What an enqueued endpoint returns.
+
+    202 when the work has been accepted and not done. The browser polls
+    /api/edi/jobs/ and reads the finished job's `result`, which is the exact
+    body the endpoint used to return synchronously - so nothing that consumed
+    the old response had to learn a new shape, it just learned to wait.
+
+    A job that is already finished by the time the response is built - inline
+    mode, or a second call against a run that landed in between - returns 200
+    with the result merged into the top level. That keeps one contract for both
+    paths: a caller that only cares about the answer reads the same fields it
+    always did, and a caller that wants to watch reads job_id and state.
+    """
+    payload = job.as_dict()
+    if not job.is_active and isinstance(job.result, dict):
+        merged = dict(job.result)
+        merged.update(payload)
+        merged["result"] = job.result
+        return Response(merged, status=status.HTTP_200_OK)
+    return Response(payload, status=http_status)
+
+
 class ValidateView(APIView):
-    """Structural validation on its own, so a user can check a file before converting."""
+    """
+    Start 834 validation. Returns at once; the work runs in the background.
+
+    This endpoint used to do everything inline: streaming structural validation,
+    the envelope facts, and the member sync that populates Member, Subscriber
+    and Dependant. On the sample files that is a third of a second. On a real
+    interchange it is not - a 2.3 MB file with twelve thousand INS loops
+    measured at 173 seconds, essentially all of it in the sync. The browser held
+    the request open for the whole of it and showed "Validating...", any proxy in
+    front of Django cut the connection first, and refreshing the page then
+    revealed the file already VALIDATED. The work was never the problem; waiting
+    on it in an HTTP request was.
+    """
 
     def post(self, request):
         client = resolve_client(request)
@@ -582,7 +475,6 @@ class ValidateView(APIView):
             )
             if not record:
                 return Response({"detail": "Unknown uploaded_file_id."}, status=404)
-            path = record.stored_file.path
         else:
             try:
                 path = get_file_path(request.data.get("file_path", ""))
@@ -590,71 +482,89 @@ class ValidateView(APIView):
                 return Response(
                     {"file_path": str(exc)}, status=status.HTTP_400_BAD_REQUEST
                 )
-
-        if record:
-            record.processing_status = ProcessingStatus.VALIDATING
-            record.save(update_fields=["processing_status"])
-
-        try:
-            result = validate_834(EDI834Parser(path).iter_segments())
-        except EDIParseError as exc:
-            if record:
-                record.processing_status = ProcessingStatus.QUARANTINED
-                record.error_message = str(exc)[:4000]
-                record.validation_errors = [str(exc)[:500]]
-                record.validated_at = timezone.now()
-                record.save(
-                    update_fields=[
-                        "processing_status",
-                        "error_message",
-                        "validation_errors",
-                        "validated_at",
-                    ]
+            record = (
+                owned_uploads(request, client).filter(stored_file=request.data.get("file_path")).first()
+            )
+            if not record:
+                return Response(
+                    {
+                        "file_path": (
+                            "That path does not correspond to a file you uploaded. "
+                            "Supply uploaded_file_id instead."
+                        )
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
                 )
-            return Response(
-                {"is_valid": False, "errors": [str(exc)]}, status=status.HTTP_200_OK
-            )
 
-        payload = result.as_dict()
+        # Pressing Validate twice must not start two syncs over the same file.
+        existing = _active_job(record, JobKind.VALIDATE)
+        if existing:
+            return _job_response(existing, status.HTTP_200_OK)
 
-        if record:
-            # Keep the stored status honest, and keep the result. A file that
-            # fails validation here must not still be sitting at VALIDATED,
-            # because that is what the convert endpoint checks — and the errors
-            # must outlive the response, because that is what the screen shows
-            # after a refresh.
-            already_converted = (
-                record.processing_status == ProcessingStatus.CONVERTED
-                and result.is_valid
-            )
-            record.processing_status = (
-                record.processing_status
-                if already_converted
-                else (
-                    ProcessingStatus.VALIDATED
-                    if result.is_valid
-                    else ProcessingStatus.QUARANTINED
-                )
-            )
-            record.validation_errors = list(result.errors)[:200]
-            record.validation_warnings = list(result.warnings)[:200]
-            record.validated_at = timezone.now()
-            record.error_message = "\n".join(result.errors)[:4000]
-            record.save(
-                update_fields=[
-                    "processing_status",
-                    "error_message",
-                    "validation_errors",
-                    "validation_warnings",
-                    "validated_at",
-                ]
-            )
-            payload["uploaded_file_id"] = record.id
-            payload["status"] = canonical_status(record.processing_status)
-            payload["validated_at"] = record.validated_at
-            payload["validated_at_display"] = display_date(record.validated_at)
+        job = ProcessingJob.objects.create(
+            owner=request.user,
+            client=client,
+            uploaded_file=record,
+            kind=JobKind.VALIDATE,
+            message="Queued",
+        )
 
-        return Response(payload)
+        UploadedFile.objects.filter(pk=record.pk).update(
+            processing_status=ProcessingStatus.VALIDATING,
+            processing_started_at=record.processing_started_at or timezone.now(),
+            error_message="",
+        )
+
+        enqueue(job, run_validation)
+        return _job_response(job)
+
+
+class JobStatusView(APIView):
+    """
+    What the browser polls.
+
+    Accepts ?ids=1,2,3 for the jobs a screen is watching, or ?active=1 for
+    everything still in flight - which is what a freshly loaded page asks for,
+    because a refresh mid-run must reattach to the work rather than lose it.
+
+    reap_stale() runs here rather than on a scheduler. It is cheap (one indexed
+    query), it runs exactly when somebody is looking, and it means a job whose
+    worker was killed is reported as interrupted to the person waiting on it
+    instead of appearing to run for ever.
+    """
+
+    def get(self, request):
+        reap_stale()
+        client = resolve_client(request)
+
+        queryset = scope_to_client(
+            ProcessingJob.objects.filter(owner=request.user), client
+        )
+
+        raw_ids = (request.query_params.get("ids") or "").strip()
+        if raw_ids:
+            ids = [int(part) for part in raw_ids.split(",") if part.strip().isdigit()]
+            queryset = queryset.filter(pk__in=ids[:100])
+        elif (request.query_params.get("active") or "").lower() in ("1", "true", "yes"):
+            queryset = queryset.filter(state__in=ACTIVE_STATES)
+        else:
+            queryset = queryset.order_by("-created_at")[:25]
+
+        return Response([job.as_dict() for job in queryset])
+
+
+class JobDetailView(APIView):
+    def get(self, request, pk):
+        reap_stale()
+        client = resolve_client(request)
+        job = (
+            scope_to_client(ProcessingJob.objects.filter(owner=request.user), client)
+            .filter(pk=pk)
+            .first()
+        )
+        if not job:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(job.as_dict())
 
 
 class MappingCreateView(APIView):
@@ -671,56 +581,90 @@ class MappingCreateView(APIView):
                 "template_id": template.id if template else None,
                 "version": template.version if template else None,
                 "locked": bool(template and template.is_locked),
-                "columns": [
-                    {
-                        "excel_column": detail.excel_column,
-                        "column_order": detail.column_order,
-                        "segment": detail.segment,
-                        "element": detail.element,
-                        "qualifier_element": detail.qualifier_element,
-                        "qualifier_value": detail.qualifier_value,
-                        "occurrence": detail.occurrence,
-                        "applies_to": detail.applies_to,
-                        "transform": detail.transform,
-                    }
-                    for detail in details
-                ],
+                # The whole grid: every column in the layout, each carrying its
+                # rule or blanks. Returning only the columns that had rules is
+                # what made an un-mapped column disappear from the screen.
+                "columns": layout_for(template, details),
             }
         )
 
     def post(self, request):
         client = resolve_client(request)
-        many = isinstance(request.data, list)
-        serializer = MappingSerializer(data=request.data, many=many)
+
+        # Two accepted shapes. A bare list of rules is the original contract and
+        # still works. {"columns": [...], "mappings": [...]} is what the mapping
+        # screen sends, because the screen knows something a rule list cannot
+        # express: which columns exist but are deliberately unmapped.
+        body = request.data
+        layout = None
+        if isinstance(body, dict) and ("mappings" in body or "columns" in body):
+            layout = list(body.get("columns") or []) or None
+            body = body.get("mappings") or []
+
+        many = isinstance(body, list)
+        serializer = MappingSerializer(data=body, many=many)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        payload = serializer.validated_data if many else [serializer.validated_data]
-        saved = []
-        with transaction.atomic():
-            for rule in payload:
-                saved.append(
-                    save_mapping(
-                        rule,
-                        owner=request.user,
-                        template_name=rule.get("template_name", "Default"),
-                        client=client,
-                    )
-                )
+        payload = [dict(rule) for rule in (serializer.validated_data if many else [serializer.validated_data])]
+        template_name = (payload[0].get("template_name") or "Default") if payload else "Default"
+        for rule in payload:
+            rule.pop("template_name", None)
 
+        if many:
+            # A whole screenful. The incoming set is the truth for the template:
+            # rules for columns the user unmapped are removed, and a version is
+            # minted only if anything actually differs from what is stored.
+            # Saving these one at a time was how a cleared column stayed mapped
+            # and how three identical Convert clicks produced four versions.
+            saved = save_mappings(
+                payload,
+                owner=request.user,
+                template_name=template_name,
+                client=client,
+                columns=layout,
+            )
+        else:
+            single = save_mapping(
+                payload[0], owner=request.user, template_name=template_name, client=client
+            )
+            saved = {
+                "template_id": single["template_id"],
+                "version": single["version"],
+                "changed": True,
+                "columns": 1,
+            }
+
+        details = get_mappings(request.user, saved["template_id"], client=client)
+        template = get_template(request.user, saved["template_id"], client=client)
         return Response(
             {
-                "message": "Mapping saved",
-                "template_id": saved[0]["template_id"] if saved else None,
-                "version": saved[0]["version"] if saved else None,
-                "mappings": saved,
+                "message": "Mapping saved." if saved.get("changed") else "Mapping unchanged.",
+                "template_id": saved["template_id"],
+                "version": saved["version"],
+                "changed": bool(saved.get("changed")),
+                "columns": saved.get("columns", 0),
+                "mappings": layout_for(template, details),
             },
             status=status.HTTP_201_CREATED,
         )
 
 
 class Convert834View(APIView):
-    """Run the full pipeline and record the result."""
+    """
+    Start a conversion. Returns at once; the work runs in the background.
+
+    The endpoint's job is now three things: check that this user may convert
+    this file, decide and persist the mapping the run will use, and queue it.
+    Everything expensive - parsing, row building, writing the workbook - happens
+    in edi.services.tasks.run_conversion behind a job row.
+
+    The mapping is saved here rather than in the task on purpose. Saving is
+    fast, it is the thing the user pressed the button to do, and doing it inside
+    the request means a failure to save is a 400 the user sees immediately
+    rather than a background job that fails for a reason nobody connects to a
+    dropdown they changed.
+    """
 
     def post(self, request):
         serializer = ConvertRequestSerializer(data=request.data)
@@ -768,196 +712,130 @@ class Convert834View(APIView):
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-        # Issue 10: the backend enforces the validation gate itself.
+        # The backend enforces the validation gate itself.
         if record.processing_status not in CONVERTIBLE_STATUSES:
             return Response(
                 {
                     "detail": (
-                        "This file is in status {s} and cannot be converted. Only a file "
+                        "{name} is in status {s} and cannot be converted. Only a file "
                         "that passed 834 validation may be converted."
-                    ).format(s=record.processing_status),
+                    ).format(name=record.original_filename, s=canonical_status(record.processing_status)),
                     "uploaded_file_id": record.id,
-                    "status": record.processing_status,
+                    "status": canonical_status(record.processing_status),
                     "errors": (record.error_message or "").splitlines()[:25],
                 },
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
 
-        source_path = record.stored_file.path
+        existing = _active_job(record, JobKind.CONVERT)
+        if existing:
+            return _job_response(existing, status.HTTP_200_OK)
 
         # ---------------------------------------------------------------
-        # Issue 6.2: a conversion must be able to say which rules produced it.
+        # Which rules will run, and making sure they are the stored ones.
         #
-        # The old behaviour: the browser posted ad-hoc rules, the run used
-        # them, and ConversionHistory recorded mapping_template=None. The
-        # saved templates in the database were ignored, and the audit trail
-        # could say a workbook had been produced but not how — which is the
-        # one question an audit trail exists to answer.
-        #
-        # Inline rules are now persisted to the user's template first, so the
-        # run has a template id and a version like any other. The exact rules
-        # are frozen onto the history row as well, because a template id only
-        # resolves while the template still exists and a snapshot always does.
+        # Inline rules are persisted to the user's template first, so the run
+        # has a template id and a version like any other and the audit trail can
+        # say how a workbook was produced. save_mappings() compares the incoming
+        # set against what is stored and only mints a new version when the
+        # mapping genuinely changed - the previous code minted one on every
+        # click, because a completed conversion locks the version it used and
+        # the next save then cloned all thirty rules to version n+1 whether or
+        # not a single dropdown had moved.
         # ---------------------------------------------------------------
         template = None
         mapping_source = "TEMPLATE"
 
         if data.get("mappings"):
-            rules = data["mappings"]
+            rules = [dict(rule) for rule in data["mappings"]]
             headers = data["headers"]
             mapping_source = "INLINE"
             try:
-                with transaction.atomic():
-                    for index, rule in enumerate(rules):
-                        saved = save_mapping(
-                            rule,
-                            owner=request.user,
-                            template_name=rule.get("template_name", "Default"),
-                            client=client,
-                        )
-                    if rules:
-                        template = get_template(request.user, saved["template_id"], client=client)
-            except Exception:  # noqa: BLE001
-                # Provenance is worth having but not worth failing a conversion
-                # over. The snapshot below still records exactly what ran.
+                saved = save_mappings(
+                    rules,
+                    owner=request.user,
+                    template_name=(rules[0].get("template_name") or "Default") if rules else "Default",
+                    client=client,
+                    columns=list(headers),
+                )
+                template = get_template(request.user, saved["template_id"], client=client)
+            except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "Could not persist inline mapping rules for upload %s", record.id
+                )
+                return Response(
+                    {
+                        "detail": (
+                            "The mapping could not be saved, so the conversion was not "
+                            "started. {kind}: {exc}"
+                        ).format(kind=type(exc).__name__, exc=exc)
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
         else:
             template = get_template(
                 request.user, data.get("mapping_template_id"), client=client
             )
-            rules = get_mappings(
+            details = get_mappings(
                 request.user, data.get("mapping_template_id"), client=client
             )
-            if not rules:
+            if not details:
                 return Response(
-                    {"detail": "No mapping rules supplied and no saved template found."},
+                    {
+                        "detail": (
+                            "No mapping rules were supplied and no saved template was "
+                            "found. Configure the Data Mapping Schema first."
+                        )
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            headers = data.get("headers") or headers_for(rules)
+            rules = [
+                {
+                    "excel_column": detail.excel_column,
+                    "column_order": detail.column_order,
+                    "segment": detail.segment,
+                    "element": detail.element,
+                    "qualifier_element": detail.qualifier_element or "",
+                    "qualifier_value": detail.qualifier_value or "",
+                    "component_index": detail.component_index,
+                    "occurrence": detail.occurrence or 1,
+                    "applies_to": detail.applies_to,
+                    "transform": detail.transform,
+                    "default_value": detail.default_value or "",
+                    "is_required": bool(detail.is_required),
+                }
+                for detail in details
+            ]
+            headers = data.get("headers") or headers_for(details)
 
-        snapshot = _mapping_snapshot(rules)
-        kinds = column_kinds(rules)
+        for rule in rules:
+            rule.pop("template_name", None)
 
-        record.processing_status = ProcessingStatus.CONVERTING
-        record.conversion_error = ""
-        record.save(update_fields=["processing_status", "conversion_error"])
-
-        history = ConversionHistory.objects.create(
+        job = ProcessingJob.objects.create(
             owner=request.user,
             client=client,
             uploaded_file=record,
-            mapping_template=template,
-            mapping_version=template.version if template else None,
-            mapping_snapshot=snapshot,
-            mapping_source=mapping_source,
-            status=ConversionHistory.Status.RUNNING,
-            started_at=timezone.now(),
-        )
-
-        warnings = []
-
-        def rows_with_warnings(stream):
-            """Drain warnings as rows go past so nothing is held for a second pass."""
-            for row in stream:
-                warnings.extend(row.pop("__warnings__", []))
-                yield row
-
-        try:
-            parser = EDI834Parser(source_path)
-            parsed = StreamingParsedFile(parser.iter_segments())
-
-            rows = rows_with_warnings(
-                iter_excel_rows(parsed, rules, header_segments=parsed.header)
-            )
-
-            workbook = generate_excel(
-                headers,
-                rows,
-                owner_id=request.user.id,
-                source_name=record.original_filename,
-                # Part 4 and Part 14: the mapping decides which columns are
-                # real dates and which must stay text, so the workbook carries
-                # 08-25-2026 in a date cell and 001234567 with its leading zero.
-                column_kinds=kinds,
-            )
-        except (EDIParseError, ValueError, OSError) as exc:
-            history.status = ConversionHistory.Status.FAILED
-            history.error_message = str(exc)[:4000]
-            history.finished_at = timezone.now()
-            history.save()
-            # Back to VALIDATED, not stuck at CONVERTING. A status nothing can
-            # leave is how a file becomes permanently unusable.
-            record.processing_status = ProcessingStatus.VALIDATED
-            record.conversion_error = str(exc)[:4000]
-            record.save(update_fields=["processing_status", "conversion_error"])
-            logger.exception("conversion failed for %s", source_path)
-            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-
-        generated = GeneratedFile.objects.create(
-            owner=request.user,
-            client=client,
-            uploaded_file=record,
-            generated_filename=workbook.filename,
-            stored_file=workbook.relative_path,
-            row_count=workbook.row_count,
-            file_size_bytes=workbook.size_bytes,
-        )
-
-        subscribers = parsed.subscriber_count
-        history.generated_file = generated
-        history.status = (
-            ConversionHistory.Status.PARTIAL if warnings else ConversionHistory.Status.SUCCESS
-        )
-        history.members_processed = subscribers
-        history.dependents_processed = parsed.dependent_count
-        history.rows_written = workbook.row_count
-        history.warning_count = len(warnings)
-        history.warnings = warnings[:500]
-        history.finished_at = timezone.now()
-        history.save()
-
-        # Issue 16: the version that produced this workbook is now frozen. A
-        # later edit clones to the next version rather than rewriting what this
-        # history row points at.
-        lock_template(template)
-
-        # Issue 1: CONVERTED is a stored fact now. It used to be a React
-        # variable, which is why refreshing the page took the download link
-        # with it even though the workbook was on disk and its GeneratedFile
-        # row was in the database.
-        record.processing_status = ProcessingStatus.CONVERTED
-        record.converted_at = timezone.now()
-        record.conversion_error = ""
-        record.save(
-            update_fields=["processing_status", "converted_at", "conversion_error"]
-        )
-
-        return Response(
-            {
-                "message": "834 converted successfully",
-                "conversion_id": history.id,
-                "uploaded_file_id": record.id,
-                "status": canonical_status(record.processing_status),
-                "converted_at": record.converted_at,
-                "converted_at_display": display_date(record.converted_at),
-                "generated_file_id": generated.id,
-                "file": workbook.filename,
-                "download_url": "/api/edi/download/{pk}/".format(pk=generated.id),
-                "preview_url": "/api/edi/download/{pk}/preview/".format(pk=generated.id),
+            kind=JobKind.CONVERT,
+            message="Queued",
+            result={
+                "rules": rules,
                 "headers": list(headers),
-                "rows_generated": workbook.row_count,
-                "subscribers": subscribers,
-                "dependents": parsed.dependent_count,
-                "mapping_template_id": template.id if template else None,
-                "mapping_version": template.version if template else None,
+                "template_id": template.id if template else None,
                 "mapping_source": mapping_source,
-                "mapping_columns": len(snapshot),
-                "warning_count": len(warnings),
-                "warnings": warnings[:25],
-            }
+                # force=1 reconverts even when the mapping is unchanged, for the
+                # case where the source file was re-uploaded under the same id.
+                "force": str(request.query_params.get("force", "")).lower()
+                in ("1", "true", "yes")
+                or bool(request.data.get("force")),
+            },
         )
+
+        UploadedFile.objects.filter(pk=record.pk).update(
+            processing_status=ProcessingStatus.CONVERTING, conversion_error=""
+        )
+
+        enqueue(job, run_conversion)
+        return _job_response(job)
 
 
 class DownloadView(APIView):
@@ -969,14 +847,45 @@ class DownloadView(APIView):
     checked here and the download is counted for the audit trail.
     """
 
+    def head(self, request, pk):
+        """
+        Headers only. Never counted, never opened.
+
+        Django maps HEAD onto the GET handler when a view does not define one,
+        which is wrong for this endpoint in two ways: it increments
+        downloaded_count, and it opens the file to stream a body that is then
+        discarded. The browser download path issues a HEAD first so that a 403
+        or a 404 surfaces as an error the screen can show rather than as an
+        error page rendered inside a hidden iframe - and that preflight was
+        therefore recording a second download every time. On a system holding
+        PHI, downloaded_count is the record of who took data out and how often;
+        doubling it makes the one number an auditor asks for untrue.
+        """
+        client = resolve_client(request)
+        generated = owned_generated(request, client).filter(pk=pk).first()
+        if not generated:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        response["Content-Disposition"] = 'attachment; filename="{name}"'.format(
+            name=generated.generated_filename
+        )
+        if generated.file_size_bytes:
+            response["Content-Length"] = str(generated.file_size_bytes)
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+
     def get(self, request, pk):
         client = resolve_client(request)
         generated = owned_generated(request, client).filter(pk=pk).first()
         if not generated:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # F() rather than read-modify-write: two downloads racing would
+        # otherwise both read the same count and both write the same successor,
+        # recording one.
         GeneratedFile.objects.filter(pk=pk).update(
-            downloaded_count=generated.downloaded_count + 1,
+            downloaded_count=F("downloaded_count") + 1,
             last_downloaded_at=timezone.now(),
         )
         return FileResponse(
@@ -1008,6 +917,10 @@ class GeneratedFilePreviewView(APIView):
             limit = min(int(request.query_params.get("limit", 100)), MAX_PREVIEW_ROWS)
         except (TypeError, ValueError):
             limit = 100
+        try:
+            offset = max(0, int(request.query_params.get("offset", 0)))
+        except (TypeError, ValueError):
+            offset = 0
 
         try:
             workbook = load_workbook(
@@ -1026,6 +939,13 @@ class GeneratedFilePreviewView(APIView):
             headers = [
                 "" if value is None else str(value) for value in next(iterator, ()) or ()
             ]
+            # Skipped with the iterator rather than by materialising and
+            # slicing: read_only mode streams the sheet, so paging to row
+            # 40,000 costs a walk and not 40,000 dicts.
+            for _ in range(offset):
+                if next(iterator, None) is None:
+                    break
+
             rows = []
             for values in iterator:
                 if len(rows) >= limit:
@@ -1047,8 +967,15 @@ class GeneratedFilePreviewView(APIView):
                 "headers": headers,
                 "rows": rows,
                 "row_count": generated.row_count,
+                "offset": offset,
                 "returned": len(rows),
-                "truncated": bool(generated.row_count and generated.row_count > len(rows)),
+                "has_more": bool(
+                    generated.row_count and offset + len(rows) < generated.row_count
+                ),
+                "truncated": bool(
+                    generated.row_count and generated.row_count > offset + len(rows)
+                ),
+                "file_size_bytes": generated.file_size_bytes,
                 "download_url": "/api/edi/download/{pk}/".format(pk=generated.id),
             }
         )
@@ -1189,6 +1116,22 @@ class EDIFileDownloadView(APIView):
     file is never resident, which is the only way a 200 MB interchange is
     servable from a process that also has to answer other requests.
     """
+
+    def head(self, request, pk):
+        """Headers only, without opening the file. See DownloadView.head."""
+        client = resolve_client(request)
+        record = owned_uploads(request, client).filter(pk=pk).first()
+        if not record:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        response = HttpResponse(content_type="application/octet-stream")
+        response["Content-Disposition"] = 'attachment; filename="{name}"'.format(
+            name=record.original_filename
+        )
+        if record.file_size_bytes:
+            response["Content-Length"] = str(record.file_size_bytes)
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
 
     def get(self, request, pk):
         client = resolve_client(request)

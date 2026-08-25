@@ -10,6 +10,8 @@ from .api.views import (
     EDIUploadView,
     GeneratedFilePreviewView,
     HealthCheckView,
+    JobDetailView,
+    JobStatusView,
     MappingCreateView,
     SegmentDictionaryView,
     UploadListView,
@@ -28,6 +30,10 @@ urlpatterns = [
     path("files/<int:pk>/preview/", EDIFilePreviewView.as_view(), name="edi-file-preview"),
     path("files/<int:pk>/download/", EDIFileDownloadView.as_view(), name="edi-file-download"),
     path("validate/", ValidateView.as_view(), name="validate"),
+    # The background work the browser polls. Validation and conversion are
+    # enqueued, not performed, by their endpoints.
+    path("jobs/", JobStatusView.as_view(), name="jobs"),
+    path("jobs/<int:pk>/", JobDetailView.as_view(), name="job-detail"),
     path("mappings/", MappingCreateView.as_view(), name="mappings"),
     # Part 6.4: the segment and element dictionary, from the database.
     path("segments/", SegmentDictionaryView.as_view(), name="segments"),

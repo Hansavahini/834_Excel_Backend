@@ -108,10 +108,26 @@ class BriefTestCase(TestCase):
         self.addCleanup(override.disable)
 
     def upload(self, name="brief.x12", date="20250101", eff="20250101"):
-        return self.client.post(
+        """
+        Upload and validate, as the portal now does in two steps.
+
+        Upload stores bytes and returns immediately; validation, envelope
+        facts and the member sync run when Validate is pressed. Tests that
+        exercise post-validation behaviour therefore go through both, and the
+        returned response is the upload response the callers already unpack.
+        """
+        created = self.client.post(
             "/api/edi/upload/",
             {"file": SimpleUploadedFile(name, build_834(date, eff))},
         )
+        body = created.json()
+        if created.status_code == 201 and body.get("uploaded_file_id"):
+            self.client.post(
+                "/api/edi/validate/",
+                json.dumps({"uploaded_file_id": body["uploaded_file_id"]}),
+                content_type="application/json",
+            )
+        return created
 
     def convert(self, uploaded_file_id, rules=None):
         rules = RULES if rules is None else rules
@@ -295,15 +311,28 @@ class Part13MemberSection(BriefTestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(len(payload), 1)
+        # The screen shows the whole family: the matched subscriber first,
+        # then their dependants, selected by radio button. So the hit widens
+        # to everyone sharing that subscriber rather than the one row.
         self.assertEqual(payload[0]["last_name"], "ZEROTEST")
         self.assertEqual(payload[0]["record_type"], "SUBSCRIBER")
+        matches = [row for row in payload if row["ssn_last4"] == "4567"]
+        self.assertEqual(len(matches), 1)
+        head = payload[0]["id"]
+        for row in payload[1:]:
+            self.assertEqual(row["subscriber_id"], head)
 
     def test_a_punctuated_ssn_is_the_same_person(self):
         self.upload()
         response = self.client.get("/api/members/search/", {"q": "001-23-4567"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.json()), 1)
+        payload = response.json()
+        # Same family as the unpunctuated spelling, resolved through the
+        # fingerprint: exactly one row carries the searched number.
+        self.assertEqual(
+            len([row for row in payload if row["ssn_last4"] == "4567"]), 1
+        )
+        self.assertEqual(payload[0]["record_type"], "SUBSCRIBER")
 
     def test_a_short_ssn_is_a_validation_error_not_an_empty_result(self):
         """
