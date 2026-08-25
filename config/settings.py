@@ -13,6 +13,12 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 
+try:  # optional, only needed for the split-origin dev setup
+    import corsheaders  # noqa: F401
+    HAS_CORS = True
+except ImportError:  # pragma: no cover
+    HAS_CORS = False
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -29,21 +35,70 @@ SECRET_KEY = os.environ.get(
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', '1') == '1'
 
+# --- PHI key material ------------------------------------------------------
+#
+# The SSN pepper is deliberately its own setting. It used to be SECRET_KEY
+# itself, which coupled two rotation schedules that have nothing to do with
+# each other: rotating SECRET_KEY is a routine response to a leaked deployment,
+# and doing it would have re-digested every stored SSN fingerprint under a new
+# key. Nothing would have failed loudly — member matching would simply have
+# stopped matching and started creating duplicate people.
+#
+# It defaults to SECRET_KEY so an existing database keeps resolving. Set
+# SSN_PEPPER explicitly before the two ever need to move apart; changing it
+# afterwards requires re-deriving every fingerprint from plaintext, which is
+# only possible while the plaintext column is still populated.
+SSN_PEPPER = os.environ.get('SSN_PEPPER', '') or SECRET_KEY
+
+if not DEBUG:
+    # A production process must not fall back to the committed development key
+    # for either value. Failing at import is the point: a silent fallback here
+    # means PHI protected by a secret that is in the repository.
+    from django.core.exceptions import ImproperlyConfigured
+
+    if 'django-insecure-' in SECRET_KEY:
+        raise ImproperlyConfigured(
+            'DJANGO_SECRET_KEY must be set to a real secret when DEBUG is off.'
+        )
+    if 'django-insecure-' in str(SSN_PEPPER):
+        raise ImproperlyConfigured(
+            'SSN_PEPPER must be set to a real secret when DEBUG is off; it keys the '
+            'HMAC that identifies members without their plaintext SSN.'
+        )
+
 ALLOWED_HOSTS = [
-    h for h in os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if h
+    h for h in os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',') if h
 ]
 
-CSRF_TRUSTED_ORIGINS = [
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:5174',
+# The Vite dev server runs on its own origin. Everything below keeps the session
+# cookie usable across that origin without loosening anything in production.
+FRONTEND_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        'FRONTEND_ORIGINS',
+        'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174',
+    ).split(',')
+    if o.strip()
 ]
+
+CSRF_TRUSTED_ORIGINS = list(FRONTEND_ORIGINS)
+
+CORS_ALLOWED_ORIGINS = list(FRONTEND_ORIGINS)
+CORS_ALLOW_CREDENTIALS = True
+
+# Session and CSRF cookies must survive a cross-origin XHR from the dev server.
+SESSION_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_HTTPONLY = False  # the SPA reads this cookie to set X-CSRFToken
+SESSION_COOKIE_AGE = 60 * 60 * 8
+SESSION_SAVE_EVERY_REQUEST = True
 
 
 # Application definition
 
-INSTALLED_APPS = [
+INSTALLED_APPS = ([
+    'corsheaders',
+] if HAS_CORS else []) + [
 
     'django.contrib.admin',
     'django.contrib.auth',
@@ -62,7 +117,9 @@ INSTALLED_APPS = [
     'users',
 ]
 
-MIDDLEWARE = [
+MIDDLEWARE = ([
+    'corsheaders.middleware.CorsMiddleware',
+] if HAS_CORS else []) + [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
 
@@ -100,12 +157,29 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+# SQLite by default so the project runs with no external service. Set
+# POSTGRES_DB (and friends) to point the same code at Postgres for staging or
+# production; nothing else in the project needs to change.
+if os.environ.get('POSTGRES_DB'):
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ['POSTGRES_DB'],
+            'USER': os.environ.get('POSTGRES_USER', 'postgres'),
+            'PASSWORD': os.environ.get('POSTGRES_PASSWORD', ''),
+            'HOST': os.environ.get('POSTGRES_HOST', '127.0.0.1'),
+            'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+            'CONN_MAX_AGE': 60,
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+            'OPTIONS': {'timeout': 30},
+        }
+    }
 
 
 # Password validation
@@ -181,7 +255,10 @@ LOGGING = {
     "disable_existing_loggers": False,
     "formatters": {"plain": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"}},
     "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "plain"}},
-    "loggers": {"edi": {"handlers": ["console"], "level": "INFO"}},
+    "loggers": {
+        "edi": {"handlers": ["console"], "level": os.environ.get("EDI_LOG_LEVEL", "INFO")},
+        "django.request": {"handlers": ["console"], "level": "ERROR"},
+    },
 }
 
 if not DEBUG:

@@ -31,16 +31,49 @@ STATE_CODE = RegexValidator(r"^[A-Z]{2}$", "Two letter uppercase state or territ
 PHONE_DIGITS = RegexValidator(r"^\d{10}$", "Store phone as ten digits with no punctuation.")
 
 
+def normalize_ssn(value):
+    """
+    Reduce an SSN to the digits it is made of.
+
+    Trading partners send 123-45-6789, 123 45 6789 and 123456789 for the same
+    person. Fingerprinting the raw string meant those three spellings produced
+    three different digests and therefore three duplicate members, which is the
+    kind of bug that only shows up once a second sponsor comes on board.
+    """
+    if not value:
+        return ""
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    return digits[:9] if len(digits) >= 9 else digits
+
+
 def ssn_fingerprint(ssn):
     """
     Keyed digest used for identity matching so no query ever needs the plaintext.
     The pepper lives in settings, not in the database, so a stolen database file
     does not yield a rainbow table of nine digit numbers.
+
+    The pepper is its own setting rather than SECRET_KEY. They were the same
+    value, which quietly coupled two unrelated rotation schedules: rotating
+    SECRET_KEY is routine — it is what you do after a leaked deployment — and
+    doing it here would have re-digested every SSN under a new key, so no stored
+    fingerprint would match any incoming member again and identity resolution
+    would silently start creating duplicates instead of matching. SSN_PEPPER
+    defaults to SECRET_KEY so existing fingerprints keep working; set it
+    explicitly and the two can move independently.
     """
-    if not ssn:
+    normalized = normalize_ssn(ssn)
+    if not normalized:
         return ""
-    pepper = settings.SECRET_KEY.encode()
-    return hmac.new(pepper, ssn.encode(), hashlib.sha256).hexdigest()
+    pepper = getattr(settings, "SSN_PEPPER", None) or settings.SECRET_KEY
+    if not isinstance(pepper, bytes):
+        pepper = str(pepper).encode()
+    return hmac.new(pepper, normalized.encode(), hashlib.sha256).hexdigest()
+
+
+def ssn_last4_of(ssn):
+    """Last four digits, which is all any screen in this application displays."""
+    normalized = normalize_ssn(ssn)
+    return normalized[-4:] if len(normalized) >= 4 else ""
 
 
 class MemberType(models.TextChoices):
@@ -81,6 +114,14 @@ class Member(models.Model):
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="members"
     )
+    client = models.ForeignKey(
+        "users.Client",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="members",
+        help_text="Health plan this record belongs to. Null on rows written before tenancy existed.",
+    )
     member_type = models.CharField(max_length=3, choices=MemberType.choices, db_index=True)
     subscriber = models.ForeignKey(
         "self",
@@ -88,7 +129,20 @@ class Member(models.Model):
         blank=True,
         on_delete=models.PROTECT,
         related_name="dependents",
-        help_text="Null on a subscriber row, set on every dependent row.",
+        help_text=(
+            "Null on a subscriber row. Set on a dependent row once the subscriber is "
+            "known; null with subscriber_pending=True while it is not."
+        ),
+    )
+    subscriber_pending = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text=(
+            "This dependent arrived before its subscriber loop and is waiting to be "
+            "linked. The member_type stays DEP; it is never rewritten to SUB to satisfy "
+            "a constraint, because the relink pass only looks at DEP rows and a row "
+            "flipped to SUB would never come back."
+        ),
     )
     relationship_code = models.CharField(
         max_length=2, choices=RelationshipCode.choices, default=RelationshipCode.SELF
@@ -111,12 +165,14 @@ class Member(models.Model):
     name_suffix = models.CharField(max_length=10, blank=True)
 
     ssn = models.CharField(
-        max_length=9,
+        max_length=50,
         blank=True,
-        validators=[SSN_DIGITS],
         help_text=(
             "Plaintext today for parity with the source file. Move this to an application layer "
-            "encrypted field or a token before production; see the design note on PHI at rest."
+            "encrypted field or a token before production; see the design note on PHI at rest. "
+            "Normalised to nine digits on save; SSN_DIGITS is applied in clean() rather than as a "
+            "field validator because migration 0002 widened this column and the model had drifted "
+            "from it."
         ),
     )
     ssn_fingerprint = models.CharField(
@@ -124,6 +180,15 @@ class Member(models.Model):
         blank=True,
         db_index=True,
         help_text="Keyed HMAC of the SSN. Match on this, never on the plaintext column.",
+    )
+    ssn_last4 = models.CharField(
+        max_length=4,
+        blank=True,
+        help_text=(
+            "The only part of an SSN any screen displays. Stored separately so masking, "
+            "searching and the roster dropdown all work without the plaintext column, "
+            "which can then be purged. See the purge_plaintext_ssn command."
+        ),
     )
 
     gender_code = models.CharField(max_length=1, choices=GenderCode.choices, default=GenderCode.UNKNOWN)
@@ -173,18 +238,29 @@ class Member(models.Model):
             models.Index(fields=["owner", "last_name", "first_name"], name="mem_owner_name_idx"),
             models.Index(fields=["owner", "member_type", "coverage_status"], name="mem_owner_type_status_idx"),
             models.Index(fields=["subscriber", "member_type"], name="mem_subscriber_idx"),
+            models.Index(fields=["owner", "ssn_fingerprint"], name="mem_owner_ssn_idx"),
+            models.Index(fields=["owner", "member_id"], name="mem_owner_memberid_idx"),
         ]
         constraints = [
             models.UniqueConstraint(
-                fields=["owner", "member_id"],
+                fields=["owner", "client", "member_id"],
                 condition=~models.Q(member_id=""),
                 name="uniq_member_id_per_owner",
             ),
             check_constraint(
+                # A subscriber never points at a subscriber. A dependent normally
+                # does, but is allowed not to while its linkage is pending —
+                # dependents legitimately arrive before their subscriber in a
+                # change-only file, and the previous constraint forced the sync
+                # engine to lie about member_type to get such a row saved.
                 condition=(models.Q(member_type="SUB") & models.Q(subscriber__isnull=True))
-                | (models.Q(member_type="DEP") & models.Q(subscriber__isnull=False)),
+                | (models.Q(member_type="DEP") & models.Q(subscriber__isnull=False))
+                | (models.Q(member_type="DEP") & models.Q(subscriber_pending=True)),
                 name="dependent_requires_subscriber",
-                violation_error_message="A subscriber row has no subscriber link, a dependent row must have one.",
+                violation_error_message=(
+                    "A subscriber row has no subscriber link; a dependent row needs one "
+                    "unless it is explicitly flagged as pending linkage."
+                ),
             ),
             check_constraint(
                 condition=models.Q(date_of_death__isnull=True)
@@ -195,8 +271,26 @@ class Member(models.Model):
         ]
 
     def save(self, *args, **kwargs):
-        self.ssn_fingerprint = ssn_fingerprint(self.ssn)
+        self.ssn = normalize_ssn(self.ssn)
+        if self.ssn:
+            # Derived while the plaintext is still in hand. Once it has been
+            # purged these keep their values rather than being blanked.
+            self.ssn_fingerprint = ssn_fingerprint(self.ssn)
+            self.ssn_last4 = ssn_last4_of(self.ssn)
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None:
+            fields = set(update_fields)
+            # A partial save must still persist the derived columns, or the
+            # fingerprint drifts away from the value it is meant to digest.
+            if fields & {"ssn"}:
+                fields.update({"ssn_fingerprint", "ssn_last4"})
+            kwargs["update_fields"] = tuple(fields)
         super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        if self.ssn:
+            SSN_DIGITS(normalize_ssn(self.ssn))
 
     @property
     def full_name(self):
@@ -204,7 +298,9 @@ class Member(models.Model):
 
     @property
     def masked_ssn(self):
-        return "XXX-XX-{last4}".format(last4=self.ssn[-4:]) if self.ssn else ""
+        """Reads the derived column, so it survives a plaintext purge."""
+        last4 = self.ssn_last4 or ssn_last4_of(self.ssn)
+        return "XXX-XX-{last4}".format(last4=last4) if last4 else ""
 
     def __str__(self):
         return "{name} [{kind}]".format(name=self.full_name, kind=self.member_type)
@@ -331,10 +427,12 @@ class MemberDailyStatus(models.Model):
         indexes = [
             models.Index(fields=["status_date", "change_type"], name="mds_date_change_idx"),
             models.Index(fields=["member", "-status_date"], name="mds_member_date_idx"),
+            models.Index(fields=["uploaded_file", "member"], name="mds_file_member_idx"),
         ]
         constraints = [
             models.UniqueConstraint(
-                fields=["member", "status_date"], name="uniq_member_status_per_date"
+                fields=["member", "status_date", "uploaded_file"],
+                name="uniq_member_status_per_date",
             )
         ]
 

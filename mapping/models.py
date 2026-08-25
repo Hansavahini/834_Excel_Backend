@@ -52,11 +52,28 @@ class MappingTemplate(models.Model):
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="mapping_templates"
     )
+    client = models.ForeignKey(
+        "users.Client",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="mapping_templates",
+        help_text="Health plan this record belongs to. Null on rows written before tenancy existed.",
+    )
     mapping_name = models.CharField(max_length=120)
     description = models.TextField(blank=True)
     version = models.PositiveIntegerField(default=1)
     is_default = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
+    locked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Set the moment this version is used by a completed conversion. A locked "
+            "version is never edited again; an edit clones it to the next version, so "
+            "ConversionHistory.mapping_version keeps meaning what it said at the time."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -64,14 +81,20 @@ class MappingTemplate(models.Model):
         ordering = ("owner_id", "mapping_name", "-version")
         constraints = [
             models.UniqueConstraint(
-                fields=["owner", "mapping_name", "version"], name="uniq_template_name_version_per_owner"
+                fields=["owner", "client", "mapping_name", "version"],
+                name="uniq_template_name_version_per_owner",
             ),
             models.UniqueConstraint(
-                fields=["owner"],
+                fields=["owner", "client"],
                 condition=models.Q(is_default=True),
                 name="one_default_template_per_owner",
             ),
         ]
+
+    @property
+    def is_locked(self):
+        """True once a completed conversion has used this version."""
+        return self.locked_at is not None
 
     def __str__(self):
         return "{name} v{version}".format(name=self.mapping_name, version=self.version)

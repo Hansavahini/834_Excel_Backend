@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable, List, Optional
 
+from .element_codes import element_position, normalize_element, normalize_segment
 from .transforms import apply_transform
 
 logger = logging.getLogger("edi.row_builder")
@@ -27,11 +28,14 @@ def _normalise_rule(rule) -> dict:
     the same builder serves a saved template and an ad-hoc request body.
     """
     if isinstance(rule, dict):
+        segment = normalize_segment(rule.get("segment") or "")
         return {
             "excel_column": rule.get("excel_column", ""),
-            "segment": (rule.get("segment") or "").upper(),
-            "element": (rule.get("element") or "").upper(),
-            "qualifier_element": (rule.get("qualifier_element") or "").upper(),
+            "segment": segment,
+            "element": normalize_element(rule.get("element") or "", segment),
+            "qualifier_element": normalize_element(
+                rule.get("qualifier_element") or "", segment
+            ),
             "qualifier_value": rule.get("qualifier_value") or "",
             "component_index": rule.get("component_index"),
             "occurrence": rule.get("occurrence") or 1,
@@ -40,11 +44,14 @@ def _normalise_rule(rule) -> dict:
             "default_value": rule.get("default_value") or "",
             "is_required": bool(rule.get("is_required")),
         }
+    model_segment = normalize_segment(rule.segment_element.segment_name)
     return {
         "excel_column": rule.excel_column,
-        "segment": rule.segment_element.segment_name.upper(),
-        "element": rule.segment_element.element_code.upper(),
-        "qualifier_element": (rule.qualifier_element or "").upper(),
+        "segment": model_segment,
+        "element": normalize_element(rule.segment_element.element_code, model_segment),
+        "qualifier_element": normalize_element(
+            rule.qualifier_element or "", model_segment
+        ),
         "qualifier_value": rule.qualifier_value or "",
         "component_index": rule.component_index,
         "occurrence": rule.occurrence or 1,
@@ -56,11 +63,15 @@ def _normalise_rule(rule) -> dict:
 
 
 def _element_index(element_code: str, segment_name: str) -> Optional[int]:
-    """NM103 in segment NM1 is element index 3."""
-    if not element_code.startswith(segment_name):
-        return None
-    tail = element_code[len(segment_name):]
-    return int(tail) if tail.isdigit() else None
+    """
+    NM103 in segment NM1 is element index 3.
+
+    Delegates to element_codes so the hyphenated spelling resolves too. The
+    previous version sliced the segment id off the front and int()'d the rest,
+    which turned NM1-03 into "-03" and returned None, and a None index means
+    resolve() returns "" for every row in the file.
+    """
+    return element_position(element_code, segment_name)
 
 
 def resolve(rule: dict, segments: List) -> str:

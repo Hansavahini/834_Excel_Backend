@@ -72,13 +72,21 @@ def convert_834_to_member(loop) -> dict:
         "employment_status_code": "",
         "student_status_code": "",
         "plan_code": "",
+        "insurance_line_code": "HLT",
         "effective_date": None,
         "termination_date": None,
         "maintenance_type_code": "",
         "maintenance_reason_code": "",
+        # One entry per HD segment. A member with medical and dental on
+        # different dates has two coverage lines, and collapsing them into a
+        # single effective/termination pair loses one of them outright. The
+        # flat keys above stay populated from the first line so existing
+        # callers keep working.
+        "coverages": [],
     }
 
     seen_insured_nm1 = False
+    current_coverage = None
 
     for segment in segments:
         name = segment.name
@@ -102,12 +110,24 @@ def convert_834_to_member(loop) -> dict:
             member["first_name"] = segment.get(4).strip()[:35]
             member["middle_name"] = segment.get(5).strip()[:25]
             member["name_suffix"] = segment.get(7).strip()[:10]
-            if segment.get(8).strip() in ("34", "ZZ", "MI"):
+            qualifier = segment.get(8).strip()
+            if qualifier == "34":
+                # NM108=34 means the identification code in NM109 is a Social
+                # Security Number. Copying it into member_id — which is what
+                # used to happen — put nine plaintext digits into a column that
+                # the roster, the search results and the admin list all render
+                # in clear, so masking the ssn column while this ran achieved
+                # nothing at all. The SSN goes to the SSN field, where it is
+                # fingerprinted and masked; member_id is left empty because the
+                # sponsor did not supply a non-SSN identifier. Identity
+                # resolution falls back to the fingerprint, so nothing is lost.
+                digits = "".join(ch for ch in segment.get(9) if ch.isdigit())
+                if len(digits) == 9:
+                    member["ssn"] = digits
+                else:
+                    member["member_id"] = segment.get(9).strip()[:80]
+            elif qualifier in ("ZZ", "MI"):
                 member["member_id"] = segment.get(9).strip()[:80]
-                if segment.get(8).strip() == "34":
-                    digits = "".join(ch for ch in segment.get(9) if ch.isdigit())
-                    if len(digits) == 9:
-                        member["ssn"] = digits
 
         elif name == "REF":
             qualifier = segment.get(1).strip().upper()
@@ -143,15 +163,57 @@ def convert_834_to_member(loop) -> dict:
                     member["email"] = value[:254]
 
         elif name == "HD":
-            member["plan_code"] = (segment.get(4).strip() or segment.get(3).strip())[:30]
+            line_code = (segment.get(3).strip().upper() or "HLT")[:3]
+            plan_code = (segment.get(4).strip() or segment.get(3).strip())[:30]
+            current_coverage = {
+                "insurance_line_code": line_code,
+                "plan_code": plan_code,
+                "maintenance_type_code": segment.get(1).strip()[:3],
+                "effective_date": None,
+                "termination_date": None,
+            }
+            member["coverages"].append(current_coverage)
 
         elif name == "DTP":
             qualifier = segment.get(1).strip()
             parsed = parse_x12_date(segment.get(3))
-            if qualifier == DTP_BENEFIT_BEGIN:
-                member["effective_date"] = parsed
-            elif qualifier == DTP_BENEFIT_END:
-                member["termination_date"] = parsed
+            if qualifier not in (DTP_BENEFIT_BEGIN, DTP_BENEFIT_END):
+                continue
+            key = "effective_date" if qualifier == DTP_BENEFIT_BEGIN else "termination_date"
+            # A DTP before the first HD is the loop-level date and applies to
+            # every coverage line that follows.
+            if current_coverage is not None:
+                current_coverage[key] = parsed
+            if member[key] is None:
+                member[key] = parsed
+
+    # Promote the first coverage line into the flat keys, and make sure there is
+    # always at least one line so the sync engine has something to write.
+    if member["coverages"]:
+        first = member["coverages"][0]
+        member["plan_code"] = first["plan_code"]
+        member["insurance_line_code"] = first["insurance_line_code"]
+        if first["effective_date"]:
+            member["effective_date"] = first["effective_date"]
+        if first["termination_date"]:
+            member["termination_date"] = first["termination_date"]
+        for coverage in member["coverages"]:
+            if coverage["effective_date"] is None:
+                coverage["effective_date"] = member["effective_date"]
+            if coverage["termination_date"] is None:
+                coverage["termination_date"] = member["termination_date"]
+            if not coverage["maintenance_type_code"]:
+                coverage["maintenance_type_code"] = member["maintenance_type_code"]
+    else:
+        member["coverages"].append(
+            {
+                "insurance_line_code": member["insurance_line_code"],
+                "plan_code": member["plan_code"],
+                "maintenance_type_code": member["maintenance_type_code"],
+                "effective_date": member["effective_date"],
+                "termination_date": member["termination_date"],
+            }
+        )
 
     return member
 

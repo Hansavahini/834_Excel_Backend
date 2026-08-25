@@ -54,6 +54,14 @@ class UploadedFile(models.Model):
         on_delete=models.PROTECT,
         related_name="uploaded_files",
     )
+    client = models.ForeignKey(
+        "users.Client",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="uploaded_files",
+        help_text="Health plan this record belongs to. Null on rows written before tenancy existed.",
+    )
     original_filename = models.CharField(max_length=255)
     stored_file = models.FileField(upload_to=upload_to_834, max_length=500)
     file_size_bytes = models.PositiveBigIntegerField(validators=[MinValueValidator(1)])
@@ -104,7 +112,8 @@ class UploadedFile(models.Model):
         ]
         constraints = [
             models.UniqueConstraint(
-                fields=["owner", "content_sha256"], name="uniq_upload_per_owner_checksum"
+                fields=["owner", "client", "content_sha256"],
+                name="uniq_upload_per_owner_checksum",
             ),
             check_constraint(
                 condition=models.Q(processing_finished_at__isnull=True)
@@ -129,6 +138,14 @@ class GeneratedFile(models.Model):
     )
     uploaded_file = models.ForeignKey(
         UploadedFile, on_delete=models.PROTECT, related_name="generated_files"
+    )
+    client = models.ForeignKey(
+        "users.Client",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="generated_files",
+        help_text="Health plan this record belongs to. Null on rows written before tenancy existed.",
     )
     generated_filename = models.CharField(max_length=255)
     stored_file = models.FileField(upload_to=upload_to_excel, max_length=500)

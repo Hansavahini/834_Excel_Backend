@@ -26,6 +26,14 @@ class ConversionHistory(models.Model):
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="conversions"
     )
+    client = models.ForeignKey(
+        "users.Client",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="conversions",
+        help_text="Health plan this record belongs to. Null on rows written before tenancy existed.",
+    )
     uploaded_file = models.ForeignKey(
         UploadedFile, on_delete=models.PROTECT, related_name="conversions"
     )
