@@ -80,3 +80,51 @@ class MemberDailyStatusAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+# ---------------------------------------------------------------------------
+# The separated master tables.
+#
+# Registered read-only. These are a projection maintained by the sync engine,
+# not a place to correct data by hand: an edit here would be silently reverted
+# by the next file carrying that member, and in the meantime the master row and
+# the Member row it came from would disagree. Fix the source or fix the mapping.
+# ---------------------------------------------------------------------------
+
+from members.models import Dependant, EnrollmentRecord, Subscriber
+
+
+class ReadOnlyProjection(admin.ModelAdmin):
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(Subscriber)
+class SubscriberAdmin(ReadOnlyProjection):
+    # masked_ssn, never the ssn column. A changelist renders hundreds of rows.
+    list_display = ("last_name", "first_name", "masked_ssn", "member_id", "plan",
+                    "effective_date", "termination_date")
+    list_filter = ("client", "plan")
+    search_fields = ("last_name", "first_name", "member_id", "ssn_last4")
+    readonly_fields = ("masked_ssn",)
+    exclude = ("ssn", "ssn_fingerprint")
+
+
+@admin.register(Dependant)
+class DependantAdmin(ReadOnlyProjection):
+    list_display = ("last_name", "first_name", "masked_ssn", "relationship",
+                    "subscriber", "plan", "effective_date")
+    list_filter = ("client", "relationship")
+    search_fields = ("last_name", "first_name", "member_id", "ssn_last4")
+    readonly_fields = ("masked_ssn",)
+    exclude = ("ssn", "ssn_fingerprint")
+
+
+@admin.register(EnrollmentRecord)
+class EnrollmentRecordAdmin(ReadOnlyProjection):
+    list_display = ("source_file", "file_date", "member_type", "plan",
+                    "effective_date", "termination_date")
+    list_filter = ("member_type", "file_date")

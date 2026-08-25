@@ -49,6 +49,7 @@ from members.models import (
 )
 
 from .identity import resolve_member_identity
+from .roster_sync import project_member
 
 logger = logging.getLogger("edi.member_sync")
 
@@ -404,6 +405,13 @@ def sync_member_loop(
             "changed_fields": changed_fields,
         },
     )
+
+    # Parts 2 and 3: keep the separated master tables in step with this member.
+    # Inside the same atomic block on purpose — a Member row whose Subscriber
+    # or Dependant projection failed would be a person the roster can see and
+    # the master tables cannot, which is the sort of split-brain that only
+    # shows up in a reconciliation months later.
+    project_member(member, parsed_dict, source_file, owner, client)
 
     return member, change_type, changed_fields
 

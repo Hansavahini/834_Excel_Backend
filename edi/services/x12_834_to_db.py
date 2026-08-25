@@ -16,6 +16,10 @@ from __future__ import annotations
 from datetime import date
 from typing import Optional
 
+from .ssn import NON_SSN_REF_QUALIFIERS, is_structurally_impossible
+from .ssn import normalize_ssn as normalize_ssn_value
+from .ssn import ssn_from_segments
+
 INSURED = "IL"
 CUSTODIAL_PARENT = "S3"
 
@@ -72,6 +76,7 @@ def convert_834_to_member(loop) -> dict:
         "employment_status_code": "",
         "student_status_code": "",
         "plan_code": "",
+        "class_code": "",
         "insurance_line_code": "HLT",
         "effective_date": None,
         "termination_date": None,
@@ -83,7 +88,32 @@ def convert_834_to_member(loop) -> dict:
         # flat keys above stay populated from the first line so existing
         # callers keep working.
         "coverages": [],
+        # Anything the SSN rules refused, so the caller can log it rather than
+        # discovering an empty column three files later.
+        "ssn_warnings": [],
     }
+
+    # ---------------------------------------------------------------
+    # Part 14: the SSN comes from the qualifiers, not from position.
+    #
+    # Resolved up front, over the whole loop, because the correct source
+    # (NM109 under NM108=34) can appear after segments that used to overwrite
+    # it. REF*0F is deliberately not consulted: it is the subscriber number,
+    # and on a dependant loop it carries the *subscriber's* value, so reading
+    # it as the dependant's SSN gives every child in a family their father's
+    # number.
+    # ---------------------------------------------------------------
+    resolved_ssn, ssn_warning = ssn_from_segments(segments)
+    if resolved_ssn:
+        member["ssn"] = resolved_ssn
+        if is_structurally_impossible(resolved_ssn):
+            member["ssn_warnings"].append(
+                "SSN ending {last4} is not a number the SSA issues; stored as sent.".format(
+                    last4=resolved_ssn[-4:]
+                )
+            )
+    elif ssn_warning:
+        member["ssn_warnings"].append(ssn_warning)
 
     seen_insured_nm1 = False
     current_coverage = None
@@ -110,34 +140,44 @@ def convert_834_to_member(loop) -> dict:
             member["first_name"] = segment.get(4).strip()[:35]
             member["middle_name"] = segment.get(5).strip()[:25]
             member["name_suffix"] = segment.get(7).strip()[:10]
-            qualifier = segment.get(8).strip()
+            qualifier = segment.get(8).strip().upper()
             if qualifier == "34":
-                # NM108=34 means the identification code in NM109 is a Social
-                # Security Number. Copying it into member_id — which is what
-                # used to happen — put nine plaintext digits into a column that
-                # the roster, the search results and the admin list all render
-                # in clear, so masking the ssn column while this ran achieved
-                # nothing at all. The SSN goes to the SSN field, where it is
-                # fingerprinted and masked; member_id is left empty because the
-                # sponsor did not supply a non-SSN identifier. Identity
-                # resolution falls back to the fingerprint, so nothing is lost.
-                digits = "".join(ch for ch in segment.get(9) if ch.isdigit())
-                if len(digits) == 9:
-                    member["ssn"] = digits
-                else:
+                # NM108=34 says NM109 is a Social Security Number. The SSN
+                # itself was already resolved above; all that is left is the
+                # case where the value under a 34 qualifier is not nine digits,
+                # which means the sponsor mislabelled an identifier. Keeping it
+                # as member_id preserves the value without pretending it is an
+                # SSN.
+                #
+                # Note what does not happen: a valid SSN is never copied into
+                # member_id. That is what used to happen, and member_id is
+                # rendered in clear on the roster, in search results and in the
+                # admin, so masking the ssn column achieved nothing while nine
+                # plaintext digits sat in the column next to it.
+                if not normalize_ssn_value(segment.get(9))[0]:
                     member["member_id"] = segment.get(9).strip()[:80]
-            elif qualifier in ("ZZ", "MI"):
+            elif qualifier in ("ZZ", "MI", "N", "C"):
+                # Carrier or sponsor assigned member identifier. Numeric or
+                # not, it is not an SSN and must never be treated as one.
                 member["member_id"] = segment.get(9).strip()[:80]
 
         elif name == "REF":
             qualifier = segment.get(1).strip().upper()
             value = segment.get(2).strip()
             if qualifier == REF_SUBSCRIBER_NUMBER:
+                # The subscriber number, and only that. It is repeated verbatim
+                # on every dependant in the family, which is precisely why it
+                # cannot double as an SSN column.
                 member["subscriber_number"] = value[:80]
             elif qualifier == REF_GROUP_NUMBER:
                 member["group_number"] = value[:50]
             elif qualifier == REF_UNION_LOCAL:
                 member["local"] = value[:30]
+            elif qualifier in NON_SSN_REF_QUALIFIERS and not member["member_id"]:
+                # Recorded as an identifier of last resort so the value is not
+                # lost, but never as an SSN.
+                if qualifier == "17":
+                    member["class_code"] = value[:30]
 
         elif name == "DMG":
             member["date_of_birth"] = parse_x12_date(segment.get(2))

@@ -225,9 +225,16 @@ class RowBuilderTests(TestCase):
 class TransformTests(TestCase):
     def test_transforms_are_implemented(self):
         """MappingDetail has offered these since day one; none of them did anything."""
-        self.assertEqual(apply_transform("20250101", "DATE_MDY"), "01/01/2025")
+        # Part 4: the portal's one date format is MM-DD-YYYY. The slashed form
+        # is still reachable by name so a saved template that asked for it does
+        # not silently change meaning.
+        self.assertEqual(apply_transform("20250101", "DATE_MDY"), "01-01-2025")
+        self.assertEqual(apply_transform("20250101", "DATE_MDY_SLASH"), "01/01/2025")
         self.assertEqual(apply_transform("20250101", "DATE_ISO"), "2025-01-01")
         self.assertEqual(apply_transform("111223333", "SSN_DASHED"), "111-22-3333")
+        # Part 14: nine digits, leading zero intact, and nothing else accepted.
+        self.assertEqual(apply_transform("001234567", "SSN"), "001234567")
+        self.assertEqual(apply_transform("12345678", "SSN"), "")
         self.assertEqual(apply_transform("111223333", "SSN_LAST4"), "XXX-XX-3333")
         self.assertEqual(apply_transform("9375551234", "PHONE"), "(937) 555-1234")
 

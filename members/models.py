@@ -438,3 +438,307 @@ class MemberDailyStatus(models.Model):
 
     def __str__(self):
         return "{member} present on {date}".format(member=self.member_id, date=self.status_date)
+
+
+# ---------------------------------------------------------------------------
+# Subscriber and Dependant — the separated master tables.
+#
+# Why these exist alongside Member, rather than replacing it.
+#
+# Member is the operational person table. It carries the self-referencing
+# subscriber link, the eligibility spans, the daily presence rows and the
+# identity resolution that stops one person becoming three. All of that is
+# load-bearing and none of it is duplicated here.
+#
+# What Member cannot do is answer "how many subscribers do we hold" or "show me
+# the dependants and nothing else" with a table, and it cannot carry a unique
+# constraint on SSN, because a subscriber and their spouse legitimately occupy
+# the same table and a partial index over a mixed table is a poor way to say
+# "one row per person per role". Subscriber and Dependant are that statement,
+# maintained by the sync engine as a projection of Member: one row per SSN per
+# role per tenant, enforced by the database rather than by convention.
+#
+# The projection is deliberately one-way. Nothing writes Member from here.
+# ---------------------------------------------------------------------------
+
+
+class RosterPerson(models.Model):
+    """Fields common to both master tables. Abstract; creates no table."""
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+"
+    )
+    client = models.ForeignKey(
+        "users.Client",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text="Health plan this record belongs to.",
+    )
+
+    ssn = models.CharField(
+        max_length=9,
+        blank=True,
+        validators=[SSN_DIGITS],
+        help_text=(
+            "Exactly nine digits, no punctuation, leading zeros preserved. Normalised "
+            "on save. Unique per tenant when present; blank is allowed because a "
+            "sponsor is entitled to send a member with no SSN, and SQLite would treat "
+            "several blanks as a collision under a plain unique index."
+        ),
+    )
+    ssn_fingerprint = models.CharField(max_length=64, blank=True, db_index=True)
+    ssn_last4 = models.CharField(max_length=4, blank=True)
+
+    member_id = models.CharField(max_length=80, blank=True, db_index=True)
+    first_name = models.CharField(max_length=35, blank=True)
+    last_name = models.CharField(max_length=60, blank=True)
+    dob = models.DateField(null=True, blank=True)
+    gender = models.CharField(max_length=1, choices=GenderCode.choices, default=GenderCode.UNKNOWN)
+    plan = models.CharField(max_length=30, blank=True)
+    effective_date = models.DateField(null=True, blank=True)
+    termination_date = models.DateField(null=True, blank=True)
+
+    source_file = models.ForeignKey(
+        UploadedFile,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text=(
+            "Most recent 834 this person was carried in. The full list is in "
+            "EnrollmentRecord — this column is the newest one, not the only one."
+        ),
+    )
+    first_source_file = models.ForeignKey(
+        UploadedFile,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text="The file this person first appeared in. Never overwritten.",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        self.ssn = normalize_ssn(self.ssn)
+        if self.ssn:
+            self.ssn_fingerprint = ssn_fingerprint(self.ssn)
+            self.ssn_last4 = ssn_last4_of(self.ssn)
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None:
+            fields = set(update_fields)
+            if "ssn" in fields:
+                fields.update({"ssn_fingerprint", "ssn_last4"})
+            kwargs["update_fields"] = tuple(fields)
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        if self.ssn:
+            SSN_DIGITS(normalize_ssn(self.ssn))
+
+    @property
+    def full_name(self):
+        return " ".join(part for part in (self.first_name, self.last_name) if part)
+
+    @property
+    def masked_ssn(self):
+        last4 = self.ssn_last4 or ssn_last4_of(self.ssn)
+        return "XXX-XX-{last4}".format(last4=last4) if last4 else ""
+
+
+class Subscriber(RosterPerson):
+    """
+    One subscribing employee or retiree. Never a dependant.
+
+    Issue 2: every upload created a fresh row for a member who was already on
+    file, so the same nine digits described three people after three files. The
+    unique constraint below makes that a database error rather than a reporting
+    surprise, and the sync engine uses update_or_create against it.
+    """
+
+    # Named source_member rather than member on purpose: Django gives a
+    # ForeignKey named `member` the column attribute `member_id`, which would
+    # collide with the sponsor-assigned member_id column the brief specifies.
+    source_member = models.OneToOneField(
+        Member,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="subscriber_record",
+        help_text="Link back to the operational person row this was projected from.",
+    )
+
+    class Meta:
+        ordering = ("last_name", "first_name")
+        indexes = [
+            models.Index(fields=["owner", "last_name", "first_name"], name="sub_owner_name_idx"),
+            models.Index(fields=["owner", "ssn_fingerprint"], name="sub_owner_ssn_idx"),
+        ]
+        constraints = [
+            # Uniqueness is per tenant rather than global. Sponsor-assigned data
+            # is only unique inside one health plan, and a global constraint on
+            # SSN would make one plan's roster block another plan from loading
+            # the same person — who is genuinely enrolled in both.
+            models.UniqueConstraint(
+                fields=["owner", "client", "ssn"],
+                condition=~models.Q(ssn=""),
+                name="uniq_subscriber_ssn_per_tenant",
+                violation_error_message="A subscriber with this SSN already exists for this client.",
+            ),
+            models.UniqueConstraint(
+                fields=["owner", "client", "member_id"],
+                condition=~models.Q(member_id=""),
+                name="uniq_subscriber_member_id_per_tenant",
+            ),
+        ]
+
+    def __str__(self):
+        return "{name} [SUB]".format(name=self.full_name)
+
+
+class Dependant(RosterPerson):
+    """One spouse, child or other dependant, hanging off exactly one Subscriber."""
+
+    subscriber = models.ForeignKey(
+        Subscriber,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="dependants",
+        help_text=(
+            "Null only while the dependant is waiting for its subscriber loop to "
+            "arrive. An 834 does not promise the subscriber comes first."
+        ),
+    )
+    relationship = models.CharField(
+        max_length=2, choices=RelationshipCode.choices, default=RelationshipCode.CHILD
+    )
+    source_member = models.OneToOneField(
+        Member,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="dependant_record",
+    )
+
+    class Meta:
+        ordering = ("last_name", "first_name")
+        indexes = [
+            models.Index(fields=["owner", "last_name", "first_name"], name="dep_owner_name_idx"),
+            models.Index(fields=["owner", "ssn_fingerprint"], name="dep_owner_ssn_idx"),
+            models.Index(fields=["subscriber"], name="dep_subscriber_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["owner", "client", "ssn"],
+                condition=~models.Q(ssn=""),
+                name="uniq_dependant_ssn_per_tenant",
+                violation_error_message="A dependant with this SSN already exists for this client.",
+            ),
+            models.UniqueConstraint(
+                fields=["owner", "client", "member_id"],
+                condition=~models.Q(member_id=""),
+                name="uniq_dependant_member_id_per_tenant",
+            ),
+        ]
+
+    def __str__(self):
+        return "{name} [DEP]".format(name=self.full_name)
+
+
+class EnrollmentRecord(models.Model):
+    """
+    One appearance of one person in one 834, kept forever.
+
+    This is the half of Part 2 that is easy to lose sight of. De-duplicating the
+    master record is only correct if the thing it replaces is preserved
+    somewhere, otherwise "do not create a second row" quietly becomes "throw the
+    second file away". The master tables hold the current truth; this table
+    holds every version of it that any file ever asserted, so a member who
+    appears in three files has one Subscriber row and three rows here.
+    """
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="enrollment_records"
+    )
+    client = models.ForeignKey(
+        "users.Client", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+    subscriber = models.ForeignKey(
+        Subscriber, null=True, blank=True, on_delete=models.CASCADE, related_name="enrollments"
+    )
+    dependant = models.ForeignKey(
+        Dependant, null=True, blank=True, on_delete=models.CASCADE, related_name="enrollments"
+    )
+
+    source_file = models.ForeignKey(
+        UploadedFile, on_delete=models.PROTECT, related_name="enrollment_records"
+    )
+    file_date = models.DateField(null=True, blank=True, db_index=True)
+
+    plan = models.CharField(max_length=30, blank=True)
+    insurance_line_code = models.CharField(max_length=3, blank=True)
+    effective_date = models.DateField(null=True, blank=True)
+    termination_date = models.DateField(null=True, blank=True)
+    maintenance_type_code = models.CharField(max_length=3, blank=True)
+    relationship = models.CharField(max_length=2, blank=True)
+    member_type = models.CharField(max_length=3, choices=MemberType.choices)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-file_date", "-created_at")
+        indexes = [
+            models.Index(fields=["subscriber", "-file_date"], name="enr_sub_date_idx"),
+            models.Index(fields=["dependant", "-file_date"], name="enr_dep_date_idx"),
+            models.Index(fields=["source_file"], name="enr_file_idx"),
+        ]
+        constraints = [
+            check_constraint(
+                condition=(
+                    models.Q(subscriber__isnull=False, dependant__isnull=True)
+                    | models.Q(subscriber__isnull=True, dependant__isnull=False)
+                ),
+                name="enrollment_belongs_to_exactly_one_person",
+                violation_error_message=(
+                    "An enrollment record belongs to a subscriber or a dependant, not both "
+                    "and not neither."
+                ),
+            ),
+            check_constraint(
+                condition=models.Q(termination_date__isnull=True)
+                | models.Q(effective_date__isnull=True)
+                | models.Q(termination_date__gte=models.F("effective_date")),
+                name="enr_term_not_before_effective",
+            ),
+            # One row per person per file per coverage line. A re-upload of the
+            # same file updates rather than appending, so history grows with
+            # files received and not with times somebody clicked upload.
+            models.UniqueConstraint(
+                fields=["subscriber", "source_file", "insurance_line_code"],
+                condition=models.Q(subscriber__isnull=False),
+                name="uniq_sub_enrollment_per_file_line",
+            ),
+            models.UniqueConstraint(
+                fields=["dependant", "source_file", "insurance_line_code"],
+                condition=models.Q(dependant__isnull=False),
+                name="uniq_dep_enrollment_per_file_line",
+            ),
+        ]
+
+    @property
+    def person(self):
+        return self.subscriber or self.dependant
+
+    def __str__(self):
+        return "{who} in {file}".format(
+            who=self.subscriber_id or self.dependant_id, file=self.source_file_id
+        )

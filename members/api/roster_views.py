@@ -25,6 +25,7 @@ from rest_framework.views import APIView
 from files.models import UploadedFile
 from members.models import Member, ssn_fingerprint
 from users.tenancy import resolve_client, scope_to_client
+from members.api.serializers import display_date
 from members.services.presence import (
     ABSENT,
     PRESENT,
@@ -42,7 +43,9 @@ def _parse_date(value):
     value = (value or "").strip()
     if not value:
         return None
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"):
+    # MM-DD-YYYY first: it is the format this portal now emits everywhere, so
+    # a value round-tripped from the UI parses as what it was written as.
+    for fmt in ("%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y"):
         try:
             return datetime.strptime(value, fmt).date()
         except ValueError:
@@ -82,6 +85,7 @@ class FileDatesView(APIView):
                 continue
             seen[item.file_date] = {
                 "file_date": item.file_date,
+                "file_date_display": display_date(item.file_date),
                 "uploaded_file_id": item.id,
                 "file_name": item.original_filename,
                 "is_full_file": item.is_full_file,
@@ -291,12 +295,15 @@ class MemberRosterView(APIView):
                     # plaintext was being sent for every one of them.
                     "masked_ssn": member.masked_ssn,
                     "date_of_birth": member.date_of_birth,
+                    "date_of_birth_display": display_date(member.date_of_birth),
                     "gender_code": member.gender_code,
                     "plan_code": member.plan_code or resolved["span_plan_code"],
                     "class_code": member.class_code,
                     "coverage_status": member.coverage_status,
                     "effective_date": resolved["effective_date"],
+                    "effective_date_display": display_date(resolved["effective_date"]),
                     "termination_date": resolved["termination_date"],
+                    "termination_date_display": display_date(resolved["termination_date"]),
                     "insurance_line_code": resolved["insurance_line_code"],
                     "presence": resolved["presence"],
                     "presence_reason": resolved["presence_reason"],
@@ -344,8 +351,10 @@ class MemberRosterView(APIView):
                     "processing_status": selected.processing_status,
                     "sponsor_name": selected.sponsor_name,
                     "uploaded_at": selected.uploaded_at,
+                    "uploaded_at_display": display_date(selected.uploaded_at),
                 },
                 "file_date": selected.file_date,
+                "file_date_display": display_date(selected.file_date),
                 "counts": totals,
                 "count": count,
                 "page": page,

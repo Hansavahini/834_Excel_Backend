@@ -1,5 +1,10 @@
 # Core
 Django==5.2.17
+# Reads backend/.env. The project has a small built-in fallback reader so it
+# still starts without this, but install it: the fallback exists to stop a
+# missing dependency silently reverting to development defaults, not to make
+# the dependency optional.
+python-dotenv==1.1.1
 djangorestframework==3.18.0
 django-cors-headers==4.9.0
 

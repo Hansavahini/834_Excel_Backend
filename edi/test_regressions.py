@@ -21,7 +21,7 @@ from edi.services.element_codes import element_position, normalize_element
 from edi.services.loop_extractor import extract_loops
 from edi.services.parser import EDI834Parser
 from edi.services.row_builder import build_excel_rows
-from files.models import GeneratedFile, ProcessingStatus, UploadedFile
+from files.models import VALIDATED_STATUSES, GeneratedFile, ProcessingStatus, UploadedFile
 from mapping.models import MappingTemplate
 from members.models import Member, MemberDailyStatus, ssn_fingerprint
 
@@ -534,7 +534,7 @@ class ApiRegressionTests(TestCase):
                 self.assertEqual(body["status"], ProcessingStatus.QUARANTINED)
 
                 record = UploadedFile.objects.get(pk=created["uploaded_file_id"])
-                self.assertNotEqual(record.processing_status, ProcessingStatus.PARSED)
+                self.assertNotIn(record.processing_status, VALIDATED_STATUSES)
 
     def test_19_a_failed_upload_can_be_retried(self):
         """
@@ -557,7 +557,7 @@ class ApiRegressionTests(TestCase):
                 self.assertFalse(retried["duplicate"])
                 self.assertTrue(retried["retried"])
                 self.assertEqual(retried["uploaded_file_id"], record.pk)
-                self.assertEqual(retried["status"], ProcessingStatus.PARSED)
+                self.assertEqual(retried["status"], ProcessingStatus.VALIDATED)
 
                 # One file, one record: the retry must not fork the audit trail.
                 self.assertEqual(UploadedFile.objects.count(), 1)
@@ -580,7 +580,13 @@ class ApiRegressionTests(TestCase):
                 listing = self.client.get("/api/edi/uploads/").json()
                 self.assertEqual(len(listing), 1)
                 entry = listing[0]
-                self.assertEqual(entry["status"], ProcessingStatus.PARSED)
+                # Part 1: CONVERTED is a stored fact, not a React variable. A
+                # refresh at this point used to show the file back at its
+                # pre-conversion status with no download link, for a workbook
+                # that was already on disk.
+                self.assertEqual(entry["status"], ProcessingStatus.CONVERTED)
+                self.assertTrue(entry["is_converted"])
+                self.assertIsNotNone(entry["converted_at"])
                 self.assertEqual(entry["fileName"], "t.x12")
                 self.assertIsNotNone(entry["download_url"])
                 self.assertIsNotNone(entry["generated_file_id"])

@@ -43,6 +43,22 @@ class ConversionHistory(models.Model):
     mapping_version = models.PositiveIntegerField(
         null=True, blank=True, help_text="Snapshot of the template version used, so later edits do not rewrite history."
     )
+    mapping_snapshot = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "The exact rules that produced this workbook, frozen at run time. "
+            "Issue 6.2: the browser sent ad-hoc rules and the run recorded no "
+            "template at all, so the audit trail said 'converted' without being "
+            "able to say converted how. A template id and version answer that "
+            "only while the template still exists; this answers it always."
+        ),
+    )
+    mapping_source = models.CharField(
+        max_length=16,
+        blank=True,
+        help_text="TEMPLATE when a saved template drove the run, INLINE when rules came with the request.",
+    )
     generated_file = models.ForeignKey(
         GeneratedFile, null=True, blank=True, on_delete=models.PROTECT, related_name="conversions"
     )

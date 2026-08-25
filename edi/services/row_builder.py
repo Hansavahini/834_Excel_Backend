@@ -17,7 +17,7 @@ import logging
 from typing import Iterable, List, Optional
 
 from .element_codes import element_position, normalize_element, normalize_segment
-from .transforms import apply_transform
+from .transforms import apply_transform, cell_kind
 
 logger = logging.getLogger("edi.row_builder")
 
@@ -132,6 +132,25 @@ def build_row(loop, rules: List[dict], header_segments: Optional[List] = None) -
     if warnings:
         row.setdefault("__warnings__", []).extend(warnings)
     return row
+
+
+def column_kinds(mappings: List) -> dict:
+    """
+    excel_column -> DATE | TEXT | GENERAL, derived from each rule's transform.
+
+    The workbook writer cannot work this out for itself: by the time it sees a
+    value, "19600115" and "PPO-GOLD" are both strings. The mapping is the only
+    place that knows DOB is a date and SSN must never be treated as a number,
+    so the mapping is where the answer comes from.
+    """
+    kinds: dict = {}
+    for rule in mappings:
+        normalised = _normalise_rule(rule)
+        column = normalised["excel_column"]
+        if not column:
+            continue
+        kinds[column] = cell_kind(normalised["transform"])
+    return kinds
 
 
 def iter_excel_rows(loops: Iterable, mappings: List, header_segments: Optional[List] = None):

@@ -1,9 +1,52 @@
+"""
+Member serialisation.
+
+Two rules hold throughout. Nothing here ever emits a full SSN — the masked form
+and the last four digits are what every screen in this application renders, so
+sending the digits would put them in browser memory, in the network log and in
+any error report for no benefit. And every date is emitted twice: once as ISO,
+which is what sorting and filtering need, and once as the MM-DD-YYYY string the
+UI displays, so no component has to format a date itself and no two components
+can disagree about what "01-02-2025" means.
+"""
+
+from django.conf import settings
 from rest_framework import serializers
-from members.models import Member, MemberDailyStatus, MemberEligibilityHistory
+
+from members.models import (
+    Dependant,
+    EnrollmentRecord,
+    Member,
+    MemberDailyStatus,
+    MemberEligibilityHistory,
+    Subscriber,
+)
+
+DISPLAY_DATE_FORMAT = getattr(settings, "DISPLAY_DATE_FORMAT", "%m-%d-%Y")
+
+
+def display_date(value):
+    """MM-DD-YYYY, or an empty string. Never raises on a null column."""
+    if not value:
+        return ""
+    try:
+        return value.strftime(DISPLAY_DATE_FORMAT)
+    except AttributeError:
+        return str(value)
+
 
 class MemberEligibilityHistorySerializer(serializers.ModelSerializer):
     source_file_name = serializers.CharField(source="source_file.original_filename", read_only=True)
+    source_file_id = serializers.IntegerField(read_only=True)
     maintenance_type_display = serializers.CharField(source="get_maintenance_type_code_display", read_only=True)
+    effective_date_display = serializers.SerializerMethodField()
+    termination_date_display = serializers.SerializerMethodField()
+
+    def get_effective_date_display(self, obj):
+        return display_date(obj.effective_date)
+
+    def get_termination_date_display(self, obj):
+        return display_date(obj.termination_date)
 
     class Meta:
         model = MemberEligibilityHistory
@@ -12,28 +55,173 @@ class MemberEligibilityHistorySerializer(serializers.ModelSerializer):
             "insurance_line_code",
             "plan_code",
             "effective_date",
+            "effective_date_display",
             "termination_date",
+            "termination_date_display",
             "maintenance_type_code",
             "maintenance_type_display",
             "maintenance_reason_code",
+            "source_file_id",
             "source_file_name",
         )
 
+
 class MemberDailyStatusSerializer(serializers.ModelSerializer):
     file_name = serializers.CharField(source="uploaded_file.original_filename", read_only=True)
-    status_date_display = serializers.DateField(source="status_date", read_only=True)
+    uploaded_file_id = serializers.IntegerField(read_only=True)
+    # Kept under its original name because the Member Search screen renders it.
+    # It now carries MM-DD-YYYY rather than the ISO string it used to duplicate.
+    status_date_display = serializers.SerializerMethodField()
+
+    def get_status_date_display(self, obj):
+        return display_date(obj.status_date)
 
     class Meta:
         model = MemberDailyStatus
         fields = (
             "id",
             "file_name",
+            "uploaded_file_id",
             "status_date",
             "status_date_display",
             "change_type",
             "changed_fields",
             "created_at",
         )
+
+
+class EnrollmentRecordSerializer(serializers.ModelSerializer):
+    """
+    One appearance of one person in one file.
+
+    This is what Part 13 asks the Member section to show: the same SSN in two
+    834s produces one master record and two of these, so the enrollment on
+    01-01-2025 is still readable after the file carrying 01-01-2026 arrives.
+    """
+
+    file_name = serializers.CharField(source="source_file.original_filename", read_only=True)
+    source_file_id = serializers.IntegerField(read_only=True)
+    file_date_display = serializers.SerializerMethodField()
+    effective_date_display = serializers.SerializerMethodField()
+    termination_date_display = serializers.SerializerMethodField()
+
+    def get_file_date_display(self, obj):
+        return display_date(obj.file_date)
+
+    def get_effective_date_display(self, obj):
+        return display_date(obj.effective_date)
+
+    def get_termination_date_display(self, obj):
+        return display_date(obj.termination_date)
+
+    class Meta:
+        model = EnrollmentRecord
+        fields = (
+            "id",
+            "source_file_id",
+            "file_name",
+            "file_date",
+            "file_date_display",
+            "plan",
+            "insurance_line_code",
+            "effective_date",
+            "effective_date_display",
+            "termination_date",
+            "termination_date_display",
+            "maintenance_type_code",
+            "relationship",
+            "member_type",
+        )
+
+
+class RosterPersonSerializer(serializers.Serializer):
+    """Shared shape for the two master tables. Masked SSN only."""
+
+    id = serializers.IntegerField(read_only=True)
+    member_id = serializers.CharField(read_only=True)
+    first_name = serializers.CharField(read_only=True)
+    last_name = serializers.CharField(read_only=True)
+    full_name = serializers.CharField(read_only=True)
+    masked_ssn = serializers.CharField(read_only=True)
+    ssn_last4 = serializers.CharField(read_only=True)
+    dob = serializers.DateField(read_only=True)
+    gender = serializers.CharField(read_only=True)
+    plan = serializers.CharField(read_only=True)
+    effective_date = serializers.DateField(read_only=True)
+    termination_date = serializers.DateField(read_only=True)
+    dob_display = serializers.SerializerMethodField()
+    effective_date_display = serializers.SerializerMethodField()
+    termination_date_display = serializers.SerializerMethodField()
+    source_file_name = serializers.SerializerMethodField()
+    enrollment_count = serializers.SerializerMethodField()
+    enrollments = serializers.SerializerMethodField()
+
+    def get_dob_display(self, obj):
+        return display_date(obj.dob)
+
+    def get_effective_date_display(self, obj):
+        return display_date(obj.effective_date)
+
+    def get_termination_date_display(self, obj):
+        return display_date(obj.termination_date)
+
+    def get_source_file_name(self, obj):
+        return obj.source_file.original_filename if obj.source_file_id else ""
+
+    def get_enrollment_count(self, obj):
+        return obj.enrollments.count()
+
+    def get_enrollments(self, obj):
+        return EnrollmentRecordSerializer(
+            obj.enrollments.select_related("source_file").order_by(
+                "-file_date", "-created_at"
+            ),
+            many=True,
+        ).data
+
+
+class SubscriberSerializer(RosterPersonSerializer):
+    record_type = serializers.SerializerMethodField()
+    dependants = serializers.SerializerMethodField()
+
+    def get_record_type(self, obj):
+        return "SUBSCRIBER"
+
+    def get_dependants(self, obj):
+        return [
+            {
+                "id": dependant.id,
+                "full_name": dependant.full_name,
+                "relationship": dependant.relationship,
+                "relationship_display": dependant.get_relationship_display(),
+                "masked_ssn": dependant.masked_ssn,
+                "dob": dependant.dob,
+                "dob_display": display_date(dependant.dob),
+                "plan": dependant.plan,
+            }
+            for dependant in obj.dependants.all()
+        ]
+
+
+class DependantSerializer(RosterPersonSerializer):
+    record_type = serializers.SerializerMethodField()
+    relationship = serializers.CharField(read_only=True)
+    relationship_display = serializers.CharField(source="get_relationship_display", read_only=True)
+    subscriber = serializers.SerializerMethodField()
+
+    def get_record_type(self, obj):
+        return "DEPENDANT"
+
+    def get_subscriber(self, obj):
+        if not obj.subscriber_id:
+            return None
+        return {
+            "id": obj.subscriber.id,
+            "full_name": obj.subscriber.full_name,
+            "member_id": obj.subscriber.member_id,
+            "masked_ssn": obj.subscriber.masked_ssn,
+        }
+
 
 class MemberSerializer(serializers.ModelSerializer):
     daily_statuses = MemberDailyStatusSerializer(many=True, read_only=True)
@@ -42,6 +230,54 @@ class MemberSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(read_only=True)
     file_count = serializers.SerializerMethodField()
     source_files = serializers.SerializerMethodField()
+    date_of_birth_display = serializers.SerializerMethodField()
+    record_type = serializers.SerializerMethodField()
+    master_record = serializers.SerializerMethodField()
+    enrollment_history = serializers.SerializerMethodField()
+
+    def get_date_of_birth_display(self, obj):
+        return display_date(obj.date_of_birth)
+
+    def get_record_type(self, obj):
+        return "SUBSCRIBER" if obj.member_type == "SUB" else "DEPENDANT"
+
+    def get_master_record(self, obj):
+        """
+        The Subscriber or Dependant row this person occupies.
+
+        Included so a caller can see that two files carrying the same SSN
+        resolved to one master record, which is the assertion Part 2 makes and
+        the thing a verification screen is there to check.
+        """
+        record = getattr(obj, "subscriber_record", None) or getattr(
+            obj, "dependant_record", None
+        )
+        if record is None:
+            return None
+        return {
+            "id": record.id,
+            "table": "subscriber" if isinstance(record, Subscriber) else "dependant",
+            "masked_ssn": record.masked_ssn,
+            "member_id": record.member_id,
+            "effective_date": record.effective_date,
+            "effective_date_display": display_date(record.effective_date),
+            "termination_date": record.termination_date,
+            "termination_date_display": display_date(record.termination_date),
+        }
+
+    def get_enrollment_history(self, obj):
+        """Every file this person was carried in, newest first, never collapsed."""
+        record = getattr(obj, "subscriber_record", None) or getattr(
+            obj, "dependant_record", None
+        )
+        if record is None:
+            return []
+        return EnrollmentRecordSerializer(
+            record.enrollments.select_related("source_file").order_by(
+                "-file_date", "-created_at"
+            ),
+            many=True,
+        ).data
 
     def get_file_count(self, obj):
         """How many distinct files this member has appeared in."""
@@ -67,7 +303,9 @@ class MemberSerializer(serializers.ModelSerializer):
                     "uploaded_file_id": row.uploaded_file_id,
                     "file_name": row.uploaded_file.original_filename,
                     "file_date": row.uploaded_file.file_date,
+                    "file_date_display": display_date(row.uploaded_file.file_date),
                     "status_date": row.status_date,
+                    "status_date_display": display_date(row.status_date),
                     "change_type": row.change_type,
                     "changed_fields": row.changed_fields,
                 }
@@ -79,6 +317,7 @@ class MemberSerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "member_type",
+            "record_type",
             "relationship_code",
             "member_id",
             "subscriber_number",
@@ -94,12 +333,15 @@ class MemberSerializer(serializers.ModelSerializer):
             "ssn_last4",
             "gender_code",
             "date_of_birth",
+            "date_of_birth_display",
             "plan_code",
             "class_code",
             "coverage_status",
             "subscriber_pending",
             "file_count",
             "source_files",
+            "master_record",
+            "enrollment_history",
             "daily_statuses",
-            "eligibility_history"
+            "eligibility_history",
         )

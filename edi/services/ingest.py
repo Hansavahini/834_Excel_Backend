@@ -31,6 +31,7 @@ from members.models import CustodialParent
 
 from .loop_extractor import StreamingParsedFile
 from .member_sync import relink_pending_dependents, sync_member_loop
+from .roster_sync import relink_dependants
 from .parser import EDI834Parser
 from .x12_834_to_db import convert_834_to_member, custodial_parent_from
 
@@ -56,6 +57,7 @@ def _new_summary():
         "reinstated": 0,
         "unchanged": 0,
         "relinked": 0,
+        "dependants_relinked": 0,
         "errors": [],
     }
 
@@ -149,6 +151,9 @@ def sync_uploaded_file(record, owner, client=None):
             _record_error(summary, getattr(loop, "loop_id", "?"), exc)
 
     summary["relinked"] = relink_pending_dependents(owner, client)
+    # The master tables get the same treatment, and after the Member side so
+    # the subscriber link it reads from is already correct.
+    summary["dependants_relinked"] = relink_dependants(owner, client)
 
     logger.info(
         "Synced %s of %s loops from %s (%s failed, %s relinked)",

@@ -23,6 +23,67 @@ except ImportError:  # pragma: no cover
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+# --- .env loading ----------------------------------------------------------
+#
+# Issue 10: .env was documented in .env.example and read by nothing, so every
+# value in it was ignored and the committed development SECRET_KEY was the one
+# actually in use. Values are loaded here, before any setting is read.
+#
+# python-dotenv is used when it is installed and a small reader stands in when
+# it is not, so a deployment that forgets one pip install does not silently
+# fall back to development defaults again.
+
+def _load_env_file(path):
+    """Populate os.environ from a .env file without overriding a real variable."""
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except ImportError:
+        pass
+    else:
+        load_dotenv(path, override=False)
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        # A variable already present in the real environment always wins, so a
+        # container's configuration is never overwritten by a checked-in file.
+        os.environ.setdefault(key, value)
+
+
+ENV_FILE = Path(os.environ.get("DJANGO_ENV_FILE", BASE_DIR / ".env"))
+if ENV_FILE.is_file():
+    _load_env_file(ENV_FILE)
+
+
+def env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def env_list(name, default=""):
+    return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
@@ -33,7 +94,7 @@ SECRET_KEY = os.environ.get(
 )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DJANGO_DEBUG', '1') == '1'
+DEBUG = env_bool('DJANGO_DEBUG', True)
 
 # --- PHI key material ------------------------------------------------------
 #
@@ -66,31 +127,25 @@ if not DEBUG:
             'HMAC that identifies members without their plaintext SSN.'
         )
 
-ALLOWED_HOSTS = [
-    h for h in os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',') if h
-]
+ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver')
 
 # The Vite dev server runs on its own origin. Everything below keeps the session
 # cookie usable across that origin without loosening anything in production.
-FRONTEND_ORIGINS = [
-    o.strip()
-    for o in os.environ.get(
-        'FRONTEND_ORIGINS',
-        'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174',
-    ).split(',')
-    if o.strip()
-]
+FRONTEND_ORIGINS = env_list(
+    'FRONTEND_ORIGINS',
+    'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174',
+)
 
 CSRF_TRUSTED_ORIGINS = list(FRONTEND_ORIGINS)
 
 CORS_ALLOWED_ORIGINS = list(FRONTEND_ORIGINS)
-CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_CREDENTIALS = env_bool('CORS_ALLOW_CREDENTIALS', True)
 
 # Session and CSRF cookies must survive a cross-origin XHR from the dev server.
 SESSION_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_HTTPONLY = False  # the SPA reads this cookie to set X-CSRFToken
-SESSION_COOKIE_AGE = 60 * 60 * 8
+SESSION_COOKIE_AGE = env_int('SESSION_COOKIE_AGE', 60 * 60 * 8)
 SESSION_SAVE_EVERY_REQUEST = True
 
 
@@ -173,11 +228,20 @@ if os.environ.get('POSTGRES_DB'):
         }
     }
 else:
+    # SQLite is the supported database for this deployment. The path is
+    # configurable so a container can mount the file on a volume; nothing else
+    # about the engine changes.
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
-            'OPTIONS': {'timeout': 30},
+            'NAME': Path(os.environ.get('SQLITE_PATH', BASE_DIR / 'db.sqlite3')),
+            'OPTIONS': {
+                'timeout': env_int('SQLITE_TIMEOUT', 30),
+                # WAL lets the read-heavy dashboard queries run while an upload
+                # is still writing member rows, which is the shape of every
+                # concurrent request this portal actually sees.
+                'init_command': 'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;',
+            },
         }
     }
 
@@ -217,9 +281,9 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
-MEDIA_URL = "/media/"
+MEDIA_URL = os.environ.get("DJANGO_MEDIA_URL", "/media/")
 
-MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_ROOT = Path(os.environ.get("DJANGO_MEDIA_ROOT", BASE_DIR / "media"))
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
@@ -235,11 +299,24 @@ GENERATED_SUBDIR = "generated"
 
 # Refuse uploads larger than this outright rather than discovering the problem
 # after the request has already consumed the memory.
-MAX_834_UPLOAD_BYTES = int(os.environ.get("MAX_834_UPLOAD_BYTES", 200 * 1024 * 1024))
+MAX_834_UPLOAD_BYTES = env_int("MAX_834_UPLOAD_BYTES", 200 * 1024 * 1024)
 
 # Never let a multipart upload be buffered entirely in RAM; 834 files are large.
-FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024
-DATA_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = env_int("FILE_UPLOAD_MAX_MEMORY_SIZE", 2 * 1024 * 1024)
+DATA_UPLOAD_MAX_MEMORY_SIZE = env_int("DATA_UPLOAD_MAX_MEMORY_SIZE", 5 * 1024 * 1024)
+
+# Django's own ceiling on a multipart body. It was left at the framework default
+# of 2.5 MB while MAX_834_UPLOAD_BYTES advertised 200 MB, so a large 834 was
+# refused by the middleware with a generic error long before the size check in
+# the upload view could produce a useful message. Keep the two aligned, with a
+# megabyte of slack for the multipart envelope itself.
+DATA_UPLOAD_MAX_MEMORY_SIZE = max(DATA_UPLOAD_MAX_MEMORY_SIZE, 5 * 1024 * 1024)
+FILE_UPLOAD_MAX_NUMBER_FIELDS = env_int("FILE_UPLOAD_MAX_NUMBER_FIELDS", 1000)
+
+# The date format the portal writes and displays everywhere: workbook cells,
+# API output and the browser. Kept in one place so a future change is one edit.
+DISPLAY_DATE_FORMAT = os.environ.get("DISPLAY_DATE_FORMAT", "%m-%d-%Y")
+EXCEL_DATE_FORMAT = os.environ.get("EXCEL_DATE_FORMAT", "MM-DD-YYYY")
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [

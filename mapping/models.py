@@ -105,13 +105,17 @@ class MappingDetail(models.Model):
 
     class Transform(models.TextChoices):
         NONE = "NONE", "Raw value"
-        DATE_MDY = "DATE_MDY", "CCYYMMDD to MM/DD/YYYY"
+        DATE_MDY = "DATE_MDY", "CCYYMMDD to MM-DD-YYYY"
+        DATE_MDY_SLASH = "DATE_MDY_SLASH", "CCYYMMDD to MM/DD/YYYY (legacy)"
         DATE_ISO = "DATE_ISO", "CCYYMMDD to YYYY-MM-DD"
+        SSN = "SSN", "9 digits, leading zeros kept, written as text"
         SSN_DASHED = "SSN_DASHED", "9 digits to NNN-NN-NNNN"
         SSN_LAST4 = "SSN_LAST4", "Mask to last four digits"
         UPPER = "UPPER", "Uppercase"
+        LOWER = "LOWER", "Lowercase"
         TITLE = "TITLE", "Title case"
         PHONE = "PHONE", "10 digits to (NNN) NNN-NNNN"
+        TEXT = "TEXT", "Force text, never interpreted as a number"
 
     mapping_template = models.ForeignKey(
         MappingTemplate, on_delete=models.CASCADE, related_name="details"
@@ -142,7 +146,7 @@ class MappingDetail(models.Model):
         choices=[("BOTH", "Subscriber and dependent"), ("SUB", "Subscriber only"), ("DEP", "Dependent only")],
         default="BOTH",
     )
-    transform = models.CharField(max_length=12, choices=Transform.choices, default=Transform.NONE)
+    transform = models.CharField(max_length=16, choices=Transform.choices, default=Transform.NONE)
     default_value = models.CharField(max_length=120, blank=True)
     is_required = models.BooleanField(default=False, help_text="Parser raises a warning when the source element is absent.")
 

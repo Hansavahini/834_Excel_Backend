@@ -39,11 +39,59 @@ def sha256_of(file_object, chunk_size=1024 * 1024):
 
 
 class ProcessingStatus(models.TextChoices):
-    PENDING = "PENDING", "Pending"
-    PARSING = "PARSING", "Parsing"
-    PARSED = "PARSED", "Parsed"
+    """
+    The lifecycle of one uploaded 834, as stored.
+
+    Issue 1: the browser owned three of these states and the database owned
+    none of them. Validation and conversion were React variables, so a page
+    refresh lost the validation result, lost the conversion result and lost the
+    download link — for work the server had already done and already stored.
+    The status column now carries the whole lifecycle, which is why CONVERTING
+    and CONVERTED exist here rather than only in a component's useState.
+
+    PENDING, PARSING and PARSED are the original spellings and are kept as
+    aliases so rows written before this change still read back. Everything
+    written from now on uses the canonical set.
+    """
+
+    UPLOADED = "UPLOADED", "Uploaded"
+    VALIDATING = "VALIDATING", "Validating"
+    VALIDATED = "VALIDATED", "Validated"
+    CONVERTING = "CONVERTING", "Converting"
+    CONVERTED = "CONVERTED", "Converted"
     FAILED = "FAILED", "Failed"
     QUARANTINED = "QUARANTINED", "Quarantined"
+
+    # Legacy spellings. Retained as valid choices so historic rows validate and
+    # so an in-flight deployment does not have to migrate data to read its own
+    # database. LEGACY_ALIASES below maps them onto the canonical values.
+    PENDING = "PENDING", "Pending (legacy alias for Uploaded)"
+    PARSING = "PARSING", "Parsing (legacy alias for Validating)"
+    PARSED = "PARSED", "Parsed (legacy alias for Validated)"
+
+
+# Old value -> canonical value. Used by the API layer so a client only ever
+# sees one vocabulary, whatever era the row was written in.
+LEGACY_STATUS_ALIASES = {
+    ProcessingStatus.PENDING: ProcessingStatus.UPLOADED,
+    ProcessingStatus.PARSING: ProcessingStatus.VALIDATING,
+    ProcessingStatus.PARSED: ProcessingStatus.VALIDATED,
+}
+
+# Statuses that mean "834 validation passed". Conversion checks membership of
+# this set rather than equality with one string, so a legacy PARSED row is
+# still convertible after the rename.
+VALIDATED_STATUSES = (
+    ProcessingStatus.VALIDATED,
+    ProcessingStatus.PARSED,
+    ProcessingStatus.CONVERTING,
+    ProcessingStatus.CONVERTED,
+)
+
+
+def canonical_status(value):
+    """Normalise a stored status to the vocabulary the API and the UI speak."""
+    return str(LEGACY_STATUS_ALIASES.get(value, value or ProcessingStatus.UPLOADED))
 
 
 class UploadedFile(models.Model):
@@ -94,11 +142,35 @@ class UploadedFile(models.Model):
     )
 
     processing_status = models.CharField(
-        max_length=16, choices=ProcessingStatus.choices, default=ProcessingStatus.PENDING, db_index=True
+        max_length=16, choices=ProcessingStatus.choices, default=ProcessingStatus.UPLOADED, db_index=True
     )
     error_message = models.TextField(blank=True)
     segment_count = models.PositiveIntegerField(null=True, blank=True)
     member_loop_count = models.PositiveIntegerField(null=True, blank=True)
+
+    # ---------------------------------------------------------------
+    # Issue 1: the outcome of validation and of conversion, persisted.
+    #
+    # These were browser state. The server did the work, threw the answer at
+    # the response and kept no record of it, so the only place the result
+    # existed was a React variable that a refresh destroyed. The user then
+    # re-validated and re-converted a file that had already been validated and
+    # converted, which on a PHI system also means re-reading it off disk for no
+    # reason.
+    # ---------------------------------------------------------------
+    validation_errors = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Structural errors from the last validation run. Empty list means it passed.",
+    )
+    validation_warnings = models.JSONField(default=list, blank=True)
+    validated_at = models.DateTimeField(
+        null=True, blank=True, help_text="When 834 validation last completed, pass or fail."
+    )
+    converted_at = models.DateTimeField(
+        null=True, blank=True, help_text="When the most recent workbook was generated from this file."
+    )
+    conversion_error = models.TextField(blank=True)
 
     uploaded_at = models.DateTimeField(auto_now_add=True, db_index=True)
     processing_started_at = models.DateTimeField(null=True, blank=True)
@@ -121,6 +193,26 @@ class UploadedFile(models.Model):
                 name="uf_finished_requires_started",
             ),
         ]
+
+    @property
+    def status(self):
+        """Canonical status, so a legacy PARSED row reads as VALIDATED."""
+        return canonical_status(self.processing_status)
+
+    @property
+    def is_validated(self):
+        return self.processing_status in VALIDATED_STATUSES
+
+    @property
+    def latest_generated_file(self):
+        """
+        The newest workbook produced from this file, or None.
+
+        This is what restores the download button after a refresh: the artefact
+        is a row in the database and always was, it simply had no route back to
+        the screen that needed it.
+        """
+        return self.generated_files.order_by("-generated_at").first()
 
     def __str__(self):
         return "{name} ({date})".format(name=self.original_filename, date=self.file_date or "undated")

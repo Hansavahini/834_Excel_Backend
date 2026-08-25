@@ -25,10 +25,22 @@ from typing import Iterable, List, Optional
 
 from django.conf import settings
 from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
+from .transforms import KIND_DATE, KIND_TEXT, to_date
+
 logger = logging.getLogger("edi.excel")
+
+# The one date format this portal writes. Overridable through the environment
+# so a client who insists on something else is a settings change, not a patch.
+EXCEL_DATE_FORMAT = getattr(settings, "EXCEL_DATE_FORMAT", "MM-DD-YYYY")
+
+# Excel's text format. Without it, "001234567" is stored as text but still shown
+# as 1234567 the moment the file is opened, which is the exact defect Part 14
+# describes: nothing in the pipeline reports an error and the client receives a
+# workbook with eight digit Social Security Numbers in it.
+TEXT_FORMAT = "@"
 
 MAX_SHEET_ROWS = 1_048_576  # Excel's hard limit, worth failing loudly on
 
@@ -59,6 +71,36 @@ def build_filename(source_name: str = "834") -> str:
     return "{stem}_{stamp}_{token}.xlsx".format(stem=stem, stamp=stamp, token=uuid.uuid4().hex[:8])
 
 
+def _typed_cell(sheet, value, kind: str):
+    """
+    One cell, written as the thing it is rather than as a string that resembles it.
+
+    DATE cells carry a real date and a number format, so the workbook sorts and
+    filters by date and a recipient's Excel does not re-interpret the string
+    under their own locale. TEXT cells carry the text format, which is what
+    actually preserves a leading zero. Everything else is written as it arrives.
+    """
+    from openpyxl.cell import WriteOnlyCell
+
+    if kind == KIND_DATE:
+        parsed = to_date(value)
+        if parsed is not None:
+            cell = WriteOnlyCell(sheet, value=parsed)
+            cell.number_format = EXCEL_DATE_FORMAT
+            return cell
+        # Unparseable. Write what the file said rather than a blank, so the
+        # problem is visible to whoever has to fix the mapping.
+        return WriteOnlyCell(sheet, value="" if value is None else str(value))
+
+    if kind == KIND_TEXT:
+        cell = WriteOnlyCell(sheet, value="" if value is None else str(value))
+        cell.number_format = TEXT_FORMAT
+        cell.alignment = Alignment(horizontal="left")
+        return cell
+
+    return value
+
+
 def generate_excel(
     headers: List[str],
     rows: Iterable[dict],
@@ -67,6 +109,7 @@ def generate_excel(
     owner_id=None,
     source_name: str = "834",
     sheet_title: str = "834 Conversion",
+    column_kinds: Optional[dict] = None,
 ) -> GeneratedWorkbook:
     """
     Write the workbook and return where it went.
@@ -107,10 +150,24 @@ def generate_excel(
         letter = get_column_letter(index)
         sheet.column_dimensions[letter].width = min(max(len(str(text)) + 4, 12), 40)
 
+    # header -> DATE | TEXT | GENERAL. Derived from the mapping transforms by
+    # the caller, because only the mapping knows that "DOB" is a date and "SSN"
+    # must not be treated as a number.
+    kinds = {header: (column_kinds or {}).get(header, "GENERAL") for header in headers}
+    typed_headers = [h for h in headers if kinds[h] != "GENERAL"]
+
     row_count = 0
     for row_data in rows:
         row_data.pop("__warnings__", None)
-        sheet.append([row_data.get(header, "") for header in headers])
+        if typed_headers:
+            sheet.append(
+                [
+                    _typed_cell(sheet, row_data.get(header, ""), kinds[header])
+                    for header in headers
+                ]
+            )
+        else:
+            sheet.append([row_data.get(header, "") for header in headers])
         row_count += 1
         if row_count >= MAX_SHEET_ROWS - 1:
             raise ValueError(
