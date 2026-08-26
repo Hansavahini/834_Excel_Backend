@@ -26,6 +26,7 @@ from datetime import datetime
 
 from django.db.models import Count, Q
 from django.utils import timezone
+from django.http import FileResponse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -34,6 +35,7 @@ from rest_framework.views import APIView
 from members.api.change_serializers import MemberChangeEventSerializer
 from members.models import ChangeCategory, ChangeSeverity, MemberChangeEvent, ssn_fingerprint
 from users.tenancy import resolve_client, scope_to_client
+from edi.services.excel_generator import generate_excel
 
 MAX_PAGE_SIZE = 200
 DEFAULT_PAGE_SIZE = 25
@@ -280,3 +282,76 @@ class MemberChangeBulkAcknowledgeView(APIView):
             **({"note": note} if note else {}),
         )
         return Response({"acknowledged": updated})
+
+
+class MemberChangeExportView(APIView):
+    """
+    Export the current filtered change queue to an Excel workbook.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = _apply_filters(_base_queryset(request), request.query_params)
+        queryset = queryset.select_related("previous_file", "current_file", "acknowledged_by")
+
+        # Reuse the serializer to get the formatted displays (date formats, SSN masking, etc)
+        # We do not paginate for export, as the user expects to download all matching rows.
+        serialized_data = MemberChangeEventSerializer(queryset, many=True).data
+
+        headers = [
+            "Member Name",
+            "SSN (Last 4)",
+            "Member ID",
+            "Member Type",
+            "Category",
+            "Field Changed",
+            "Original Data",
+            "Changed Data",
+            "Previous File Name",
+            "Current File Name",
+            "Severity",
+            "Status",
+            "Acknowledged At",
+            "Acknowledged By",
+            "Note",
+        ]
+
+        rows = []
+        for item in serialized_data:
+            rows.append({
+                "Member Name": item.get("member_name", ""),
+                "SSN (Last 4)": item.get("ssn_last4", ""),
+                "Member ID": item.get("member_id", ""),
+                "Member Type": "Subscriber" if item.get("member_type") == "SUB" else "Dependant",
+                "Category": item.get("category", ""),
+                "Field Changed": item.get("field_label", ""),
+                "Original Data": item.get("old_display", ""),
+                "Changed Data": item.get("new_display", ""),
+                "Previous File Name": item.get("previous_file_name", ""),
+                "Current File Name": item.get("current_file_name", ""),
+                "Severity": item.get("severity", ""),
+                "Status": "Open" if item.get("is_open") else "Acknowledged",
+                "Acknowledged At": item.get("acknowledged_at", ""),
+                "Acknowledged By": item.get("acknowledged_by_name", ""),
+                "Note": item.get("note", ""),
+            })
+
+        workbook_info = generate_excel(
+            headers=headers,
+            rows=rows,
+            owner_id=request.user.id,
+            source_name="Member_Changes_Export",
+            sheet_title="Changes"
+        )
+
+        response = FileResponse(
+            open(workbook_info.absolute_path, "rb"),
+            as_attachment=True,
+            filename=workbook_info.filename,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        if workbook_info.size_bytes:
+            response["Content-Length"] = str(workbook_info.size_bytes)
+        response["X-Content-Type-Options"] = "nosniff"
+        
+        return response

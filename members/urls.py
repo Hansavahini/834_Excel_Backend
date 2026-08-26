@@ -5,6 +5,7 @@ from .api.change_views import (
     MemberChangeDetailView,
     MemberChangeListView,
     MemberChangeSummaryView,
+    MemberChangeExportView,
 )
 from .api.roster_views import FileDatesView, MemberRosterView, SSNOptionsView
 from .api.views import (
@@ -29,6 +30,7 @@ urlpatterns = [
     # catch-all is the habit that stops the next literal route from breaking.
     path("changes/", MemberChangeListView.as_view(), name="member-changes"),
     path("changes/summary/", MemberChangeSummaryView.as_view(), name="member-changes-summary"),
+    path("changes/export/", MemberChangeExportView.as_view(), name="member-changes-export"),
     path("changes/acknowledge/", MemberChangeBulkAcknowledgeView.as_view(), name="member-changes-bulk"),
     path("changes/<int:pk>/", MemberChangeDetailView.as_view(), name="member-change-detail"),
 ]
