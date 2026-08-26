@@ -21,6 +21,52 @@ from .transforms import apply_transform, cell_kind
 
 logger = logging.getLogger("edi.row_builder")
 
+# Transforms that mean "this column is knowingly an SSN and will be masked or
+# formatted as one". Any other column that resolves to nine consecutive digits
+# under an SSN qualifier is a mapping mistake, not a coincidence.
+SSN_AWARE_TRANSFORMS = {"SSN"}
+
+
+def _looks_like_an_ssn(value: str) -> bool:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return len(digits) == 9 and len(str(value or "").strip()) <= 11
+
+
+def ssn_leak_warning(rule: dict, value: str):
+    """
+    Catch a column that is quietly carrying a Social Security Number.
+
+    This exists because it already happened. The MEMBER ID column was mapped to
+    NM1-09 qualified on NM1-01=IL, which reads as "the insured's identifier" and
+    is not: NM1-01 says whose name the segment carries, NM1-08 says what kind of
+    identifier NM1-09 holds. For any sponsor that keys on SSN, NM108 is 34 and
+    NM109 is the SSN, so the column filled with nine plaintext digits two
+    columns away from the SSN column that had been carefully masked - in a
+    workbook that gets emailed to a client.
+
+    Nothing about the pipeline noticed, because by the time a value reaches a
+    cell it is a string and every string looks alike. So the check is here,
+    where the rule that produced the value is still in hand: a column whose
+    qualifier is the SSN qualifier, or whose value is nine digits, and whose
+    transform does not say it expects an SSN, gets a warning on the conversion
+    rather than a silent cell.
+    """
+    if rule["transform"] in SSN_AWARE_TRANSFORMS:
+        return None
+    qualifies_as_ssn = (
+        rule["segment"] == "NM1"
+        and rule["element"] in ("NM109", "NM1-09")
+        and rule["qualifier_value"].strip() == "34"
+    )
+    if qualifies_as_ssn or _looks_like_an_ssn(value):
+        return (
+            "Column '{col}' resolved to what looks like a Social Security Number "
+            "under {seg}.{el}. Map it to a qualifier that designates a member "
+            "identifier (NM1-08=MI) or set the SSN transform so it is masked; as "
+            "mapped, the workbook will carry the digits in clear."
+        ).format(col=rule["excel_column"], seg=rule["segment"], el=rule["element"])
+    return None
+
 
 def _normalise_rule(rule) -> dict:
     """
@@ -152,6 +198,10 @@ def build_row(
                         loop=loop.loop_id, col=rule["excel_column"], element=rule["element"]
                     )
                 )
+
+        leak = ssn_leak_warning(rule, value)
+        if leak:
+            warnings.append(leak)
 
         row[rule["excel_column"]] = apply_transform(value, rule["transform"])
 

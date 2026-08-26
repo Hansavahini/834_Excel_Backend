@@ -59,6 +59,10 @@ def convert_834_to_member(loop) -> dict:
         "middle_name": "",
         "name_suffix": "",
         "member_id": "",
+        # Where member_id came from, so a screen can say "sponsor assigned"
+        # rather than leaving an operator to guess whether a number is the
+        # carrier's or the subscriber number standing in for it.
+        "member_id_source": "",
         "ssn": "",
         "gender_code": "U",
         "date_of_birth": None,
@@ -226,6 +230,38 @@ def convert_834_to_member(loop) -> dict:
                 current_coverage[key] = parsed
             if member[key] is None:
                 member[key] = parsed
+
+    # ---------------------------------------------------------------
+    # The member identifier: what is NOT done here, and why.
+    #
+    # The reported defect is that the member card shows no Member ID. The cause
+    # is that this column is blank on every row for any sponsor that identifies
+    # its members by SSN: such a sponsor sends NM108=34 and nothing else, so
+    # there is no carrier-assigned identifier in the loop to read.
+    #
+    # The obvious repair is to fall back to REF*0F, the subscriber number, and
+    # it is a trap. REF*0F is not unique per person and is not guaranteed unique
+    # per subscriber either - it is whatever the sponsor's extract puts there,
+    # repeated verbatim on every member of a family, and some sponsors emit a
+    # constant. Writing it into member_id makes it an identity key, because
+    # resolve_member_identity and RosterIndex both match on member_id first and
+    # match on it before anything else. Two different subscribers sharing a
+    # REF*0F would then resolve to the same person and be silently merged, which
+    # is a far worse outcome than an empty column and much harder to notice: the
+    # roster simply gets smaller.
+    #
+    # This was not hypothetical. Writing the fallback here collapsed two
+    # distinct subscribers into one on the first fixture that shared a REF*0F,
+    # and the only reason it surfaced immediately is that the existing test
+    # suite happened to build its files that way.
+    #
+    # So member_id keeps its narrow, honest meaning - a sponsor-assigned
+    # identifier or nothing - and the fallback lives at the display layer
+    # instead, in MemberSerializer.display_member_id, where it can be shown to
+    # an operator and labelled as what it is without ever being matched on.
+    # ---------------------------------------------------------------
+    if member["member_id"]:
+        member["member_id_source"] = "NM109 insured identifier"
 
     # Promote the first coverage line into the flat keys, and make sure there is
     # always at least one line so the sync engine has something to write.

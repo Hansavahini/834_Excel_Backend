@@ -3,7 +3,7 @@
 Django 5.2 + DRF. Serves JSON only; the front end is a separate project.
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv &&  .\.venv\Scripts\Activate.ps1  
 pip install -r requirements.txt
 python manage.py migrate
 python manage.py bootstrap_users

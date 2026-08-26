@@ -223,6 +223,18 @@ class Member(models.Model):
     employment_status_code = models.CharField(max_length=2, blank=True, help_text="INS08.")
     student_status_code = models.CharField(max_length=1, blank=True, help_text="INS09.")
 
+    content_digest = models.CharField(
+        max_length=64,
+        blank=True,
+        help_text=(
+            "Digest of the 834 loop that last wrote this row. When the next file "
+            "carries the same digest for the same person, nothing about them has "
+            "changed and the whole write path is skipped — which is what makes a "
+            "repeated daily roster cheap. Blank means 'unknown, do the work'. "
+            "Deliberately not indexed: it is only ever read by primary key."
+        ),
+    )
+
     first_seen_file = models.ForeignKey(
         UploadedFile, null=True, blank=True, on_delete=models.PROTECT, related_name="members_first_seen"
     )
@@ -741,4 +753,171 @@ class EnrollmentRecord(models.Model):
     def __str__(self):
         return "{who} in {file}".format(
             who=self.subscriber_id or self.dependant_id, file=self.source_file_id
+        )
+
+
+# ---------------------------------------------------------------------------
+# MemberChangeEvent — the change monitor.
+#
+# MemberDailyStatus already carried a changed_fields JSON blob, and for a while
+# that looked like enough. It is not, for three reasons that only appear once
+# somebody tries to use it.
+#
+# It is not queryable. "Show me every plan change this month" against a JSON
+# column means loading every daily status row in the period and filtering in
+# Python, which is fine on the sample data and hopeless on a year of daily
+# files. A change that matters is a row, with the field name in a column and an
+# index over it.
+#
+# It has no workflow. A change that has been reviewed and a change nobody has
+# looked at are the same blob. An operations team needs to be able to close one
+# and leave the other open, and needs that state to survive the next upload.
+#
+# And it does not say what it is comparing against. changed_fields records the
+# new value against whatever happened to be stored, with no record of which file
+# asserted the old one. When the question is "this SSN was on the day 1 file and
+# again on the day 10 file and something moved", the answer has to name both
+# files and both dates, or it cannot be checked against the source.
+#
+# So one row per field per change, keyed on the person, carrying both sides and
+# both files. MemberDailyStatus keeps its blob — it is a cheap summary for the
+# member card — and this is the table the change screen and any report read.
+# ---------------------------------------------------------------------------
+
+
+class ChangeCategory(models.TextChoices):
+    """What kind of thing moved. Drives filtering and the colour on screen."""
+
+    IDENTITY = "IDENTITY", "Name or identifier"
+    DEMOGRAPHIC = "DEMOGRAPHIC", "Demographics"
+    ADDRESS = "ADDRESS", "Address or contact"
+    PLAN = "PLAN", "Plan or class"
+    COVERAGE = "COVERAGE", "Coverage dates"
+    TERMINATION = "TERMINATION", "Coverage terminated"
+    REINSTATEMENT = "REINSTATEMENT", "Coverage reinstated"
+    ENROLLMENT = "ENROLLMENT", "New enrollment"
+
+
+class ChangeSeverity(models.TextChoices):
+    """
+    How much attention the change is worth.
+
+    Severity is a property of the field, not of the member. A surname
+    correction and a date of birth correction are both DEMOGRAPHIC and they are
+    not equally interesting: a wrong date of birth fails eligibility at the
+    point of service, a misspelled middle name does not. The mapping lives in
+    edi/services/change_monitor.py so it can be tuned without a migration.
+    """
+
+    INFO = "INFO", "Informational"
+    REVIEW = "REVIEW", "Worth a look"
+    CRITICAL = "CRITICAL", "Needs action"
+
+
+class MemberChangeEvent(models.Model):
+    """
+    One field, on one person, that a later file changed.
+
+    A member whose plan and address both moved between two files produces two
+    rows, not one, so each can be reviewed and closed on its own.
+    """
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="member_change_events"
+    )
+    client = models.ForeignKey(
+        "users.Client", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+    member = models.ForeignKey(
+        Member, on_delete=models.CASCADE, related_name="change_events"
+    )
+
+    # Denormalised identity, so the change list renders and filters without
+    # joining to Member and without ever holding a plaintext SSN. ssn_last4 is
+    # what the screen shows; the fingerprint is what "every change for this
+    # SSN" searches on.
+    ssn_fingerprint = models.CharField(max_length=64, blank=True, db_index=True)
+    ssn_last4 = models.CharField(max_length=4, blank=True)
+    # Named sponsor_member_id, not member_id. Django gives the `member`
+    # ForeignKey above the column attribute `member_id`, so a plain field of
+    # that name collides with it outright (models.E006) - the same trap the
+    # Subscriber.source_member link had to dodge. The API serialises this as
+    # member_id so nothing downstream has to know.
+    sponsor_member_id = models.CharField(max_length=80, blank=True, db_index=True)
+    member_name = models.CharField(max_length=120, blank=True)
+    member_type = models.CharField(max_length=3, choices=MemberType.choices, blank=True)
+
+    field_name = models.CharField(
+        max_length=60,
+        db_index=True,
+        help_text="The model field that moved, e.g. plan_code. Rendered through a label map.",
+    )
+    old_value = models.CharField(max_length=255, blank=True)
+    new_value = models.CharField(max_length=255, blank=True)
+
+    category = models.CharField(
+        max_length=14, choices=ChangeCategory.choices, default=ChangeCategory.DEMOGRAPHIC, db_index=True
+    )
+    severity = models.CharField(
+        max_length=8, choices=ChangeSeverity.choices, default=ChangeSeverity.REVIEW, db_index=True
+    )
+
+    # Both sides of the comparison, named. This is the part changed_fields
+    # could not do: "changed between these two files, on these two dates".
+    previous_file = models.ForeignKey(
+        UploadedFile, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        help_text="The file that last asserted the old value. Null when it predates this table.",
+    )
+    current_file = models.ForeignKey(
+        UploadedFile, on_delete=models.CASCADE, related_name="change_events",
+        help_text="The file that asserted the new value.",
+    )
+    previous_file_date = models.DateField(null=True, blank=True)
+    current_file_date = models.DateField(null=True, blank=True, db_index=True)
+
+    # Review workflow. Deliberately three columns rather than a status enum:
+    # who and when are the questions an auditor asks, and a boolean plus two
+    # nullable columns answers them without a second table.
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+    acknowledged_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    note = models.TextField(blank=True, help_text="Why this was accepted or what was done about it.")
+
+    detected_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ("-current_file_date", "-detected_at", "sponsor_member_id")
+        indexes = [
+            models.Index(fields=["owner", "client", "-current_file_date"], name="mce_owner_date_idx"),
+            models.Index(fields=["owner", "category", "severity"], name="mce_cat_sev_idx"),
+            models.Index(fields=["member", "-current_file_date"], name="mce_member_date_idx"),
+            models.Index(fields=["current_file"], name="mce_file_idx"),
+            # The open queue is the default screen, so it gets its own partial
+            # index rather than scanning the whole history to find nulls.
+            models.Index(
+                fields=["owner", "-detected_at"],
+                condition=models.Q(acknowledged_at__isnull=True),
+                name="mce_open_idx",
+            ),
+        ]
+        constraints = [
+            # One row per person per field per file. Re-running a sync over the
+            # same file must not append a second copy of a change it already
+            # recorded, which is what makes the table safe to write from a job
+            # that can be retried.
+            models.UniqueConstraint(
+                fields=["member", "current_file", "field_name"],
+                name="uniq_change_per_member_file_field",
+            ),
+        ]
+
+    @property
+    def is_open(self):
+        return self.acknowledged_at is None
+
+    def __str__(self):
+        return "{name}: {field} {old} -> {new}".format(
+            name=self.member_name, field=self.field_name, old=self.old_value or "(blank)",
+            new=self.new_value or "(blank)",
         )

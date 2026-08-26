@@ -35,6 +35,18 @@ def display_date(value):
         return str(value)
 
 
+def _file_stamp(uploaded_file):
+    """A file reference the card can render without a second request."""
+    if uploaded_file is None:
+        return None
+    return {
+        "id": uploaded_file.id,
+        "name": uploaded_file.original_filename,
+        "file_date": uploaded_file.file_date,
+        "file_date_display": display_date(uploaded_file.file_date),
+    }
+
+
 class MemberEligibilityHistorySerializer(serializers.ModelSerializer):
     source_file_name = serializers.CharField(source="source_file.original_filename", read_only=True)
     source_file_id = serializers.IntegerField(read_only=True)
@@ -242,11 +254,82 @@ class MemberSerializer(serializers.ModelSerializer):
         source="get_relationship_code_display", read_only=True
     )
 
+    display_member_id = serializers.SerializerMethodField()
+    member_id_source = serializers.SerializerMethodField()
+    recent_changes = serializers.SerializerMethodField()
+
     def get_subscriber_name(self, obj):
         return obj.subscriber.full_name if obj.subscriber_id and obj.subscriber else ""
 
+    def get_display_member_id(self, obj):
+        """
+        Something real in the Member ID box, always.
+
+        The card used to render member_id directly and show N/A whenever the
+        sponsor identified its members by SSN, which for some sponsors is every
+        row of every file. The order below is the same one the converter uses,
+        with the portal's own record number as the final fallback so the field
+        is never empty: an operator who has to quote a member to somebody can
+        always quote something, and member_id_source says which kind of
+        identifier they are looking at.
+
+        The SSN is never a candidate here, whatever the sponsor's scheme.
+        """
+        if obj.member_id:
+            return obj.member_id
+        if obj.member_type == "SUB" and obj.subscriber_number:
+            return obj.subscriber_number
+        return "PID-{pk}".format(pk=obj.pk)
+
+    def get_member_id_source(self, obj):
+        if obj.member_id:
+            return "Sponsor assigned"
+        if obj.member_type == "SUB" and obj.subscriber_number:
+            return "Subscriber number (REF*0F)"
+        return "Portal record number"
+
+    def get_recent_changes(self, obj):
+        """
+        The last handful of monitored changes for this person, newest first.
+
+        Put on the member card rather than only on the changes screen because
+        the question an operator asks when they pull up a member is usually
+        "what moved recently", and making them leave the card to find out is a
+        worse answer than five rows in the corner of it.
+        """
+        from members.api.change_serializers import MemberChangeEventSerializer
+
+        rows = obj.change_events.all().order_by("-current_file_date", "-detected_at")[:8]
+        return MemberChangeEventSerializer(rows, many=True).data
+
+    date_of_death_display = serializers.SerializerMethodField()
+    phone_display = serializers.SerializerMethodField()
+    first_seen = serializers.SerializerMethodField()
+    last_seen = serializers.SerializerMethodField()
+
     def get_date_of_birth_display(self, obj):
         return display_date(obj.date_of_birth)
+
+    def get_date_of_death_display(self, obj):
+        return display_date(obj.date_of_death)
+
+    def get_phone_display(self, obj):
+        """
+        Ten stored digits, rendered the way a person reads them. Formatting
+        here rather than in the browser so the card, any export and any future
+        notification all agree on one spelling.
+        """
+        digits = (obj.phone or "").strip()
+        if len(digits) == 10 and digits.isdigit():
+            return "({a}) {b}-{c}".format(a=digits[:3], b=digits[3:6], c=digits[6:])
+        return digits
+
+    def get_first_seen(self, obj):
+        """The file this person first appeared in, and when."""
+        return _file_stamp(obj.first_seen_file)
+
+    def get_last_seen(self, obj):
+        return _file_stamp(obj.last_seen_file)
 
     def get_record_type(self, obj):
         return "SUBSCRIBER" if obj.member_type == "SUB" else "DEPENDANT"
@@ -333,10 +416,14 @@ class MemberSerializer(serializers.ModelSerializer):
             "subscriber_id",
             "subscriber_name",
             "member_id",
+            "display_member_id",
+            "member_id_source",
             "subscriber_number",
             "group_number",
             "first_name",
+            "middle_name",
             "last_name",
+            "name_suffix",
             "full_name",
             # The plaintext column is deliberately not serialised. Nothing in
             # the UI renders a full SSN — every screen shows the mask — so
@@ -347,10 +434,27 @@ class MemberSerializer(serializers.ModelSerializer):
             "gender_code",
             "date_of_birth",
             "date_of_birth_display",
+            "date_of_death",
+            "date_of_death_display",
             "plan_code",
             "class_code",
+            "local",
+            "benefit_status_code",
+            "employment_status_code",
+            "student_status_code",
+            "address1",
+            "address2",
+            "city",
+            "state",
+            "postal_code",
+            "phone",
+            "phone_display",
+            "email",
             "coverage_status",
             "subscriber_pending",
+            "first_seen",
+            "last_seen",
+            "recent_changes",
             "file_count",
             "source_files",
             "master_record",

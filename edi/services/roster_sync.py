@@ -6,8 +6,8 @@ that pull against each other and both have to hold:
 
   * One SSN is one person. Uploading the same file twice, or two files that
     carry the same subscriber, must not produce two master rows. That is
-    update_or_create against a unique constraint, and the constraint is real —
-    it is enforced by SQLite, not by this function remembering to check.
+    update_or_create against a unique constraint, and the constraint is real -
+    it is enforced by the database, not by this function remembering to check.
 
   * File and enrollment history must survive. De-duplicating a master record is
     only safe when the thing being collapsed is written down somewhere first,
@@ -17,6 +17,15 @@ that pull against each other and both have to hold:
 
 The projection is one-way and idempotent. Nothing here writes back to Member,
 and running it twice over the same loop produces the same two rows.
+
+What changed in this version. _resolve_existing used to cost up to three queries
+per loop - SSN, then the source_member link, then member id - and _open_span
+loaded the member's coverage spans a second time after sync_eligibility had
+already loaded them. Both now take what the caller already has: a RosterIndex
+that answers the identity question from memory, and the span list the eligibility
+reconciler built. Enrollment rows are appended to the caller's buffer rather than
+written one update_or_create at a time. The resolution order and the constraints
+are unchanged; only the number of round trips it takes to honour them is.
 """
 
 from __future__ import annotations
@@ -44,7 +53,7 @@ PROJECTED_FIELDS = (
 )
 
 
-def _projected_values(member: Member, parsed_dict: dict) -> dict:
+def _projected_values(member, parsed_dict: dict) -> dict:
     return {
         "first_name": member.first_name or "",
         "last_name": member.last_name or "",
@@ -54,20 +63,28 @@ def _projected_values(member: Member, parsed_dict: dict) -> dict:
     }
 
 
-def _open_span(member: Member):
-    """The coverage span the master record's effective/termination columns show."""
-    spans = list(member.eligibility_history.all())
+def _open_span(member, spans=None):
+    """
+    The coverage span the master record's effective/termination columns show.
+
+    spans is passed in by the caller when it already has them, which is the
+    normal case: sync_eligibility has just loaded and updated the list, and
+    reloading it here was one wasted query per loop plus a chance of reading a
+    span the same transaction had just changed.
+    """
+    if spans is None:
+        spans = list(member.eligibility_history.all())
     if not spans:
         return None, None
-    open_spans = [s for s in spans if s.termination_date is None]
+    open_spans = [span for span in spans if span.termination_date is None]
     if open_spans:
-        chosen = max(open_spans, key=lambda s: s.effective_date)
+        chosen = max(open_spans, key=lambda span: span.effective_date)
         return chosen.effective_date, None
-    chosen = max(spans, key=lambda s: s.effective_date)
+    chosen = max(spans, key=lambda span: span.effective_date)
     return chosen.effective_date, chosen.termination_date
 
 
-def _resolve_existing(model, owner, client, ssn: str, member: Member, member_id: str):
+def _resolve_existing(model, owner, client, ssn: str, member, member_id: str, index=None):
     """
     Find the master row this person already occupies.
 
@@ -76,7 +93,29 @@ def _resolve_existing(model, owner, client, ssn: str, member: Member, member_id:
     the sponsor's member id. Deliberately not name and date of birth: two
     siblings with the same first initial and a shared birthday are not rare
     enough to merge on.
+
+    The index answers all three from memory when it is available. It is a cache
+    of what the database holds, so a miss still falls through to the queries
+    rather than concluding the person is new - concluding that wrongly would
+    create the duplicate this whole module exists to prevent.
     """
+    is_subscriber = model is Subscriber
+
+    if index is not None and index.usable:
+        by_ssn = index.subscriber_by_ssn if is_subscriber else index.dependant_by_ssn
+        by_member = (
+            index.subscriber_by_member if is_subscriber else index.dependant_by_member
+        )
+        pk = None
+        if ssn:
+            pk = by_ssn.get(ssn)
+        if pk is None:
+            pk = by_member.get(member.pk)
+        if pk is not None:
+            found = model.objects.filter(pk=pk).first()
+            if found is not None:
+                return found
+
     scope = model.objects.filter(owner=owner, client=client)
 
     if ssn:
@@ -96,7 +135,7 @@ def _resolve_existing(model, owner, client, ssn: str, member: Member, member_id:
     return None
 
 
-def _apply(record, values: dict, ssn: str, member: Member, member_id: str, source_file):
+def _apply(record, values: dict, ssn: str, member, member_id: str, source_file, spans=None):
     """Update a master row without ever blanking something already known."""
     changed = []
 
@@ -122,7 +161,7 @@ def _apply(record, values: dict, ssn: str, member: Member, member_id: str, sourc
         record.source_member = member
         changed.append("source_member")
 
-    effective, termination = _open_span(member)
+    effective, termination = _open_span(member, spans=spans)
     if effective is not None and record.effective_date != effective:
         record.effective_date = effective
         changed.append("effective_date")
@@ -138,17 +177,23 @@ def _apply(record, values: dict, ssn: str, member: Member, member_id: str, sourc
         changed.append("source_file")
 
     if changed:
-        record.save()
+        # update_fields rather than a full save. The full save rewrote all
+        # eighteen columns on every appearance of every member, which on an
+        # unchanged daily roster is the whole master table rewritten for
+        # nothing.
+        record.save(update_fields=tuple(dict.fromkeys(changed)))
     return record
 
 
-def _write_enrollment(record, member: Member, parsed_dict: dict, source_file, owner, client):
+def _enrollment_rows(record, member, parsed_dict: dict, source_file, owner, client):
     """
     One row per person per file per coverage line, never deleted.
 
     Keyed on the file rather than on the date so a corrected re-send and the
     original both survive, and so re-uploading the same file updates its own row
-    instead of appending a duplicate.
+    instead of appending a duplicate. Returned unsaved so the caller can write a
+    whole batch at once; the unique constraints make ignore_conflicts the right
+    way to handle a re-run.
     """
     is_subscriber = isinstance(record, Subscriber)
     coverages = parsed_dict.get("coverages") or [
@@ -161,7 +206,7 @@ def _write_enrollment(record, member: Member, parsed_dict: dict, source_file, ow
         }
     ]
 
-    written = 0
+    rows = []
     for coverage in coverages:
         effective = coverage.get("effective_date")
         termination = coverage.get("termination_date")
@@ -170,29 +215,37 @@ def _write_enrollment(record, member: Member, parsed_dict: dict, source_file, ow
             # with it. Clamp rather than lose the member.
             termination = effective
 
-        EnrollmentRecord.objects.update_or_create(
-            subscriber=record if is_subscriber else None,
-            dependant=None if is_subscriber else record,
-            source_file=source_file,
-            insurance_line_code=(coverage.get("insurance_line_code") or "HLT")[:3],
-            defaults={
-                "owner": owner,
-                "client": client,
-                "file_date": getattr(source_file, "file_date", None),
-                "plan": (coverage.get("plan_code") or "")[:30],
-                "effective_date": effective,
-                "termination_date": termination,
-                "maintenance_type_code": (coverage.get("maintenance_type_code") or "")[:3],
-                "relationship": member.relationship_code or "",
-                "member_type": member.member_type,
-            },
+        rows.append(
+            EnrollmentRecord(
+                owner=owner,
+                client=client,
+                subscriber=record if is_subscriber else None,
+                dependant=None if is_subscriber else record,
+                source_file=source_file,
+                file_date=getattr(source_file, "file_date", None),
+                plan=(coverage.get("plan_code") or "")[:30],
+                insurance_line_code=(coverage.get("insurance_line_code") or "HLT")[:3],
+                effective_date=effective,
+                termination_date=termination,
+                maintenance_type_code=(coverage.get("maintenance_type_code") or "")[:3],
+                relationship=member.relationship_code or "",
+                member_type=member.member_type,
+            )
         )
-        written += 1
-    return written
+    return rows
 
 
 @transaction.atomic
-def project_member(member: Member, parsed_dict: dict, source_file, owner, client=None):
+def project_member(
+    member,
+    parsed_dict: dict,
+    source_file,
+    owner,
+    client=None,
+    index=None,
+    context=None,
+    is_new=False,
+):
     """
     Write or update the master row for one synced member, plus its history.
 
@@ -204,19 +257,24 @@ def project_member(member: Member, parsed_dict: dict, source_file, owner, client
 
     ssn, ssn_error = normalize_ssn_value(parsed_dict.get("ssn") or member.ssn)
     if ssn_error:
-        logger.warning(
-            "Rejected SSN for member %s: %s", member.pk, ssn_error
-        )
+        logger.warning("Rejected SSN for member %s: %s", member.pk, ssn_error)
 
     member_id = (member.member_id or "")[:80]
     values = _projected_values(member, parsed_dict)
+    spans = parsed_dict.get("__spans__")
 
-    if member.member_type == "SUB":
-        model = Subscriber
-    else:
-        model = Dependant
+    model = Subscriber if member.member_type == "SUB" else Dependant
 
-    record = _resolve_existing(model, owner, client, ssn, member, member_id)
+    # is_new says the Member row was created moments ago by this same loop, so
+    # it cannot already have a master row to find. Skipping the search matters:
+    # on a first load every one of those lookups is three queries spent proving
+    # a person nobody has ever seen is not on file, which on a six thousand loop
+    # file was sixteen thousand round trips to learn nothing.
+    record = (
+        None
+        if is_new
+        else _resolve_existing(model, owner, client, ssn, member, member_id, index=index)
+    )
 
     if record is None:
         record = model(owner=owner, client=client)
@@ -227,14 +285,14 @@ def project_member(member: Member, parsed_dict: dict, source_file, owner, client
             value = values.get(field)
             if value not in (None, ""):
                 setattr(record, field, value)
-        effective, termination = _open_span(member)
+        effective, termination = _open_span(member, spans=spans)
         record.effective_date = effective
         record.termination_date = termination
         record.first_source_file = source_file
         record.source_file = source_file
         if model is Dependant:
             record.relationship = member.relationship_code or "19"
-            record.subscriber = _subscriber_row_for(member, owner, client)
+            record.subscriber_id = _subscriber_pk_for(member, owner, client, index=index)
         try:
             record.save()
         except IntegrityError:
@@ -245,27 +303,48 @@ def project_member(member: Member, parsed_dict: dict, source_file, owner, client
             record = model.objects.filter(owner=owner, client=client, ssn=ssn).first()
             if record is None:
                 raise
-            _apply(record, values, ssn, member, member_id, source_file)
+            _apply(record, values, ssn, member, member_id, source_file, spans=spans)
     else:
         if model is Dependant:
-            linked = _subscriber_row_for(member, owner, client)
-            if linked is not None and record.subscriber_id != linked.pk:
-                record.subscriber = linked
+            linked = _subscriber_pk_for(member, owner, client, index=index)
+            if linked is not None and record.subscriber_id != linked:
+                record.subscriber_id = linked
                 record.save(update_fields=["subscriber"])
             if member.relationship_code and record.relationship != member.relationship_code:
                 record.relationship = member.relationship_code
                 record.save(update_fields=["relationship"])
-        _apply(record, values, ssn, member, member_id, source_file)
+        _apply(record, values, ssn, member, member_id, source_file, spans=spans)
 
-    _write_enrollment(record, member, parsed_dict, source_file, owner, client)
+    rows = _enrollment_rows(record, member, parsed_dict, source_file, owner, client)
+    if context is not None:
+        context.add_enrollments(rows)
+    else:
+        EnrollmentRecord.objects.bulk_create(rows, ignore_conflicts=True)
+
     return record
 
 
-def _subscriber_row_for(member: Member, owner, client) -> Optional[Subscriber]:
-    """The Subscriber master row for this dependant's subscriber, if known."""
+def _subscriber_pk_for(member, owner, client, index=None):
+    """
+    The primary key of the Subscriber master row for this dependant's
+    subscriber, if known.
+
+    A primary key rather than the row itself, because every caller only ever
+    assigns it to a foreign key. Fetching the whole Subscriber to read its pk
+    back out was one query per dependant loop - four thousand of them on a first
+    load of a six thousand loop file, to learn a number the index already held.
+    """
     if member.subscriber_id is None:
         return None
-    return Subscriber.objects.filter(source_member_id=member.subscriber_id).first()
+    if index is not None and index.usable:
+        pk = index.subscriber_by_member.get(member.subscriber_id)
+        if pk is not None:
+            return pk
+    return (
+        Subscriber.objects.filter(source_member_id=member.subscriber_id)
+        .values_list("pk", flat=True)
+        .first()
+    )
 
 
 def relink_dependants(owner, client=None) -> int:
@@ -275,21 +354,42 @@ def relink_dependants(owner, client=None) -> int:
     Mirrors relink_pending_dependents() on the Member side, and runs after it,
     so a dependant recorded before its subscriber is joined up as soon as the
     subscriber exists rather than staying orphaned until someone notices.
+
+    Two queries and a dictionary rather than one query per orphan.
     """
     pending = Dependant.objects.filter(owner=owner, subscriber__isnull=True)
     if client is not None:
         pending = pending.filter(client=client)
 
+    orphans = [
+        (pk, source_member_id)
+        for pk, source_member_id in pending.values_list("pk", "source_member_id")
+        if source_member_id
+    ]
+    if not orphans:
+        return 0
+
+    subscriber_member_ids = dict(
+        Member.objects.filter(pk__in=[sm for _pk, sm in orphans])
+        .exclude(subscriber__isnull=True)
+        .values_list("pk", "subscriber_id")
+    )
+    if not subscriber_member_ids:
+        return 0
+
+    rows = Subscriber.objects.filter(
+        source_member_id__in=set(subscriber_member_ids.values())
+    ).values_list("source_member_id", "pk")
+    subscriber_pk_by_member = dict(rows)
+
     linked = 0
-    for dependant in pending.select_related("source_member"):
-        if dependant.source_member is None or dependant.source_member.subscriber_id is None:
+    for pk, source_member_id in orphans:
+        parent_member_id = subscriber_member_ids.get(source_member_id)
+        if parent_member_id is None:
             continue
-        subscriber = Subscriber.objects.filter(
-            source_member_id=dependant.source_member.subscriber_id
-        ).first()
-        if subscriber is None:
+        subscriber_pk = subscriber_pk_by_member.get(parent_member_id)
+        if subscriber_pk is None:
             continue
-        dependant.subscriber = subscriber
-        dependant.save(update_fields=["subscriber"])
+        Dependant.objects.filter(pk=pk).update(subscriber_id=subscriber_pk)
         linked += 1
     return linked
