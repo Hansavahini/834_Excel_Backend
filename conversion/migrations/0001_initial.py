@@ -40,7 +40,7 @@ class Migration(migrations.Migration):
                 'verbose_name_plural': 'conversion history',
                 'ordering': ('-created_at',),
                 'indexes': [models.Index(fields=['owner', '-created_at'], name='ch_owner_created_idx')],
-                'constraints': [models.CheckConstraint(check=models.Q(models.Q(('status', 'SUCCESS'), _negated=True), ('generated_file__isnull', False), _connector='OR'), name='successful_conversion_has_output', violation_error_message='A successful conversion must reference the workbook it produced.')],
+                'constraints': [models.CheckConstraint(condition=models.Q(models.Q(('status', 'SUCCESS'), _negated=True), ('generated_file__isnull', False), _connector='OR'), name='successful_conversion_has_output', violation_error_message='A successful conversion must reference the workbook it produced.')],
             },
         ),
         migrations.CreateModel(
@@ -59,7 +59,7 @@ class Migration(migrations.Migration):
             ],
             options={
                 'ordering': ('-created_at',),
-                'constraints': [models.UniqueConstraint(fields=('baseline_file', 'current_file'), name='uniq_comparison_pair'), models.CheckConstraint(check=models.Q(('baseline_file', models.F('current_file')), _negated=True), name='comparison_needs_two_files')],
+                'constraints': [models.UniqueConstraint(fields=('baseline_file', 'current_file'), name='uniq_comparison_pair'), models.CheckConstraint(condition=models.Q(('baseline_file', models.F('current_file')), _negated=True), name='comparison_needs_two_files')],
             },
         ),
     ]

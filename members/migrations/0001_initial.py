@@ -128,11 +128,11 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='member',
-            constraint=models.CheckConstraint(check=models.Q(models.Q(('member_type', 'SUB'), ('subscriber__isnull', True)), models.Q(('member_type', 'DEP'), ('subscriber__isnull', False)), _connector='OR'), name='dependent_requires_subscriber', violation_error_message='A subscriber row has no subscriber link, a dependent row must have one.'),
+            constraint=models.CheckConstraint(condition=models.Q(models.Q(('member_type', 'SUB'), ('subscriber__isnull', True)), models.Q(('member_type', 'DEP'), ('subscriber__isnull', False)), _connector='OR'), name='dependent_requires_subscriber', violation_error_message='A subscriber row has no subscriber link, a dependent row must have one.'),
         ),
         migrations.AddConstraint(
             model_name='member',
-            constraint=models.CheckConstraint(check=models.Q(('date_of_death__isnull', True), ('date_of_birth__isnull', True), ('date_of_death__gte', models.F('date_of_birth')), _connector='OR'), name='death_not_before_birth'),
+            constraint=models.CheckConstraint(condition=models.Q(('date_of_death__isnull', True), ('date_of_birth__isnull', True), ('date_of_death__gte', models.F('date_of_birth')), _connector='OR'), name='death_not_before_birth'),
         ),
         migrations.AddIndex(
             model_name='memberdailystatus',
@@ -160,6 +160,6 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='membereligibilityhistory',
-            constraint=models.CheckConstraint(check=models.Q(('termination_date__isnull', True), ('termination_date__gte', models.F('effective_date')), _connector='OR'), name='term_not_before_effective', violation_error_message='Termination date cannot precede the effective date.'),
+            constraint=models.CheckConstraint(condition=models.Q(('termination_date__isnull', True), ('termination_date__gte', models.F('effective_date')), _connector='OR'), name='term_not_before_effective', violation_error_message='Termination date cannot precede the effective date.'),
         ),
     ]

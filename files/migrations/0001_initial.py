@@ -78,7 +78,7 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='uploadedfile',
-            constraint=models.CheckConstraint(check=models.Q(('processing_finished_at__isnull', True), ('processing_started_at__isnull', False), _connector='OR'), name='uf_finished_requires_started'),
+            constraint=models.CheckConstraint(condition=models.Q(('processing_finished_at__isnull', True), ('processing_started_at__isnull', False), _connector='OR'), name='uf_finished_requires_started'),
         ),
         migrations.AddIndex(
             model_name='generatedfile',
