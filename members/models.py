@@ -365,6 +365,12 @@ class MemberEligibilityHistory(models.Model):
     termination_date = models.DateField(
         null=True, blank=True, help_text="Null means the span is open."
     )
+    effective_date_as_per_law = models.DateField(
+        null=True, blank=True, help_text="FOM backdated."
+    )
+    termination_date_as_per_law = models.DateField(
+        null=True, blank=True, help_text="EOM snapped term date. Null means open."
+    )
     maintenance_type_code = models.CharField(
         max_length=3, choices=MaintenanceType.choices, blank=True, help_text="INS03."
     )
@@ -392,11 +398,57 @@ class MemberEligibilityHistory(models.Model):
                 name="term_not_before_effective",
                 violation_error_message="Termination date cannot precede the effective date.",
             ),
+            check_constraint(
+                condition=models.Q(termination_date_as_per_law__isnull=True)
+                | models.Q(termination_date_as_per_law__gte=models.F("effective_date_as_per_law")),
+                name="term_not_before_effective_as_per_law",
+                violation_error_message="Termination date as per law cannot precede the effective date as per law.",
+            ),
         ]
 
     @property
     def is_open(self):
         return self.termination_date is None
+
+    def save(self, *args, **kwargs):
+        is_dependent = self.member.relationship_code != "18"  # 18 is RelationshipCode.SELF
+        has_legal_coverage = True
+        
+        if is_dependent and self.member.subscriber_number:
+            # Rule 1: Subscriber Dependency
+            has_legal_coverage = MemberEligibilityHistory.objects.filter(
+                member__subscriber_number=self.member.subscriber_number,
+                member__relationship_code="18",
+                termination_date__isnull=True
+            ).exists()
+            
+        if not has_legal_coverage:
+            self.effective_date_as_per_law = None
+            self.termination_date_as_per_law = None
+        else:
+            # Rule 3: FOM Effective Date
+            if self.effective_date:
+                self.effective_date_as_per_law = self.effective_date.replace(day=1)
+                
+            # Rule 2: EOM Termination Date (1st of next month)
+            if self.termination_date:
+                if self.termination_date.month == 12:
+                    self.termination_date_as_per_law = self.termination_date.replace(
+                        year=self.termination_date.year + 1, month=1, day=1
+                    )
+                else:
+                    self.termination_date_as_per_law = self.termination_date.replace(
+                        month=self.termination_date.month + 1, day=1
+                    )
+            else:
+                self.termination_date_as_per_law = None
+
+        if "update_fields" in kwargs:
+            fields = set(kwargs["update_fields"])
+            fields.update(["effective_date_as_per_law", "termination_date_as_per_law"])
+            kwargs["update_fields"] = list(fields)
+
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return "{start} to {end}".format(

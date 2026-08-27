@@ -90,6 +90,6 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='mappingdetail',
-            constraint=models.CheckConstraint(condition=models.Q(models.Q(('qualifier_element', ''), ('qualifier_value', '')), models.Q(models.Q(('qualifier_element', ''), _negated=True), models.Q(('qualifier_value', ''), _negated=True)), _connector='OR'), name='qualifier_element_and_value_together', violation_error_message='Give both a qualifier element and a qualifier value, or neither.'),
+            constraint=models.CheckConstraint(check=models.Q(models.Q(('qualifier_element', ''), ('qualifier_value', '')), models.Q(models.Q(('qualifier_element', ''), _negated=True), models.Q(('qualifier_value', ''), _negated=True)), _connector='OR'), name='qualifier_element_and_value_together', violation_error_message='Give both a qualifier element and a qualifier value, or neither.'),
         ),
     ]

@@ -20,7 +20,7 @@ class DependentInline(admin.TabularInline):
 class EligibilityInline(admin.TabularInline):
     model = MemberEligibilityHistory
     extra = 0
-    fields = ("insurance_line_code", "effective_date", "termination_date", "maintenance_type_code", "source_file")
+    fields = ("insurance_line_code", "effective_date", "termination_date", "effective_date_as_per_law", "termination_date_as_per_law", "maintenance_type_code", "source_file")
     readonly_fields = fields
     can_delete = False
     ordering = ("-effective_date",)
@@ -56,7 +56,7 @@ class MemberAdmin(admin.ModelAdmin):
 
 @admin.register(MemberEligibilityHistory)
 class MemberEligibilityHistoryAdmin(admin.ModelAdmin):
-    list_display = ("member", "insurance_line_code", "effective_date", "termination_date", "maintenance_type_code", "source_file")
+    list_display = ("member", "insurance_line_code", "effective_date", "termination_date", "effective_date_as_per_law", "termination_date_as_per_law", "maintenance_type_code", "source_file")
     list_filter = ("insurance_line_code", "maintenance_type_code", "effective_date")
     search_fields = ("member__last_name", "member__first_name", "member__member_id")
     autocomplete_fields = ("member", "source_file")

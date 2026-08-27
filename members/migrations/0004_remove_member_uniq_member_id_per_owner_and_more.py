@@ -60,7 +60,7 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='member',
-            constraint=models.CheckConstraint(condition=models.Q(models.Q(('member_type', 'SUB'), ('subscriber__isnull', True)), models.Q(('member_type', 'DEP'), ('subscriber__isnull', False)), models.Q(('member_type', 'DEP'), ('subscriber_pending', True)), _connector='OR'), name='dependent_requires_subscriber', violation_error_message='A subscriber row has no subscriber link; a dependent row needs one unless it is explicitly flagged as pending linkage.'),
+            constraint=models.CheckConstraint(check=models.Q(models.Q(('member_type', 'SUB'), ('subscriber__isnull', True)), models.Q(('member_type', 'DEP'), ('subscriber__isnull', False)), models.Q(('member_type', 'DEP'), ('subscriber_pending', True)), _connector='OR'), name='dependent_requires_subscriber', violation_error_message='A subscriber row has no subscriber link; a dependent row needs one unless it is explicitly flagged as pending linkage.'),
         ),
         migrations.AddConstraint(
             model_name='memberdailystatus',

@@ -129,11 +129,11 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='enrollmentrecord',
-            constraint=models.CheckConstraint(condition=models.Q(models.Q(('dependant__isnull', True), ('subscriber__isnull', False)), models.Q(('dependant__isnull', False), ('subscriber__isnull', True)), _connector='OR'), name='enrollment_belongs_to_exactly_one_person', violation_error_message='An enrollment record belongs to a subscriber or a dependant, not both and not neither.'),
+            constraint=models.CheckConstraint(check=models.Q(models.Q(('dependant__isnull', True), ('subscriber__isnull', False)), models.Q(('dependant__isnull', False), ('subscriber__isnull', True)), _connector='OR'), name='enrollment_belongs_to_exactly_one_person', violation_error_message='An enrollment record belongs to a subscriber or a dependant, not both and not neither.'),
         ),
         migrations.AddConstraint(
             model_name='enrollmentrecord',
-            constraint=models.CheckConstraint(condition=models.Q(('termination_date__isnull', True), ('effective_date__isnull', True), ('termination_date__gte', models.F('effective_date')), _connector='OR'), name='enr_term_not_before_effective'),
+            constraint=models.CheckConstraint(check=models.Q(('termination_date__isnull', True), ('effective_date__isnull', True), ('termination_date__gte', models.F('effective_date')), _connector='OR'), name='enr_term_not_before_effective'),
         ),
         migrations.AddConstraint(
             model_name='enrollmentrecord',
